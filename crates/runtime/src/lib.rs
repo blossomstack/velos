@@ -146,7 +146,7 @@ impl ContainerRuntime for FakeRuntime {
 // gathered in the constants below so they can be matched to the installed
 // version in one place:
 //
-//   run     : `container run --detach --name velos-<uid> [--env K=V ...] <image> [cmd...]`
+//   run     : `container run --detach --name velos-<uid> [--env K=V ...] [--entrypoint <cmd[0]>] <image> [cmd[1..]...]`
 //   stop    : `container stop velos-<uid>`
 //   remove  : `container delete --force velos-<uid>`
 //   list    : `container list --all --format json`
@@ -165,6 +165,39 @@ const NAME_PREFIX: &str = "velos-";
 
 fn instance_name(uid: &str) -> String {
     format!("{NAME_PREFIX}{uid}")
+}
+
+/// Build the `container run …` argv for `spec` (pure, so it's unit-testable).
+///
+/// `spec.command` follows **Kubernetes `command` semantics**: it overrides the
+/// image's `ENTRYPOINT` rather than being appended to it (OCI/Docker CMD-append,
+/// which is what bare trailing args do). So `command[0]` becomes the
+/// `--entrypoint` override and `command[1..]` are the args after the image. When
+/// `command` is empty we don't override — the image's own entrypoint/cmd runs.
+///
+/// Without this, any image carrying an `ENTRYPOINT` would run `ENTRYPOINT +
+/// command` instead of `command` (see issue #47).
+fn build_run_args(name: &str, spec: &RunSpec) -> Vec<String> {
+    let mut args = vec![
+        SUBCMD_RUN.to_string(),
+        "--detach".to_string(),
+        "--name".to_string(),
+        name.to_string(),
+    ];
+    for (k, v) in &spec.env {
+        args.push("--env".to_string());
+        args.push(format!("{k}={v}"));
+    }
+    match spec.command.split_first() {
+        Some((entrypoint, rest)) => {
+            args.push("--entrypoint".to_string());
+            args.push(entrypoint.clone());
+            args.push(spec.image.clone());
+            args.extend(rest.iter().cloned());
+        }
+        None => args.push(spec.image.clone()),
+    }
+    args
 }
 
 /// Real backend: shells out to the `container` CLI via `tokio::process`.
@@ -221,18 +254,7 @@ impl AppleContainer {
 impl ContainerRuntime for AppleContainer {
     async fn run(&self, spec: &RunSpec) -> Result<InstanceId, RuntimeError> {
         let name = instance_name(&spec.uid);
-        let mut args = vec![
-            SUBCMD_RUN.to_string(),
-            "--detach".to_string(),
-            "--name".to_string(),
-            name.clone(),
-        ];
-        for (k, v) in &spec.env {
-            args.push("--env".to_string());
-            args.push(format!("{k}={v}"));
-        }
-        args.push(spec.image.clone());
-        args.extend(spec.command.iter().cloned());
+        let args = build_run_args(&name, spec);
         self.output(&args).await?;
         Ok(InstanceId(name))
     }
@@ -354,6 +376,82 @@ mod tests {
 
         rt.remove("u1").await.unwrap();
         assert!(rt.list().await.unwrap().is_empty());
+    }
+
+    #[test]
+    fn run_args_without_command_use_image_entrypoint() {
+        // No command → don't override; let the image's own ENTRYPOINT/CMD run.
+        let got = build_run_args("velos-u1", &spec("u1"));
+        assert_eq!(got, vec!["run", "--detach", "--name", "velos-u1", "alpine"]);
+    }
+
+    #[test]
+    fn run_args_with_command_override_entrypoint() {
+        // k8s `command` semantics: command[0] becomes the entrypoint override,
+        // command[1..] are the args after the image. This makes velos schedule
+        // an image regardless of whether it carries an ENTRYPOINT.
+        let mut s = spec("u1");
+        s.command = vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "echo HI".to_string(),
+        ];
+        let got = build_run_args("velos-u1", &s);
+        assert_eq!(
+            got,
+            vec![
+                "run",
+                "--detach",
+                "--name",
+                "velos-u1",
+                "--entrypoint",
+                "/bin/sh",
+                "alpine",
+                "-c",
+                "echo HI"
+            ]
+        );
+    }
+
+    #[test]
+    fn run_args_single_element_command_overrides_entrypoint_with_no_trailing_args() {
+        let mut s = spec("u1");
+        s.command = vec!["sleep-forever".to_string()];
+        let got = build_run_args("velos-u1", &s);
+        assert_eq!(
+            got,
+            vec![
+                "run",
+                "--detach",
+                "--name",
+                "velos-u1",
+                "--entrypoint",
+                "sleep-forever",
+                "alpine"
+            ]
+        );
+    }
+
+    #[test]
+    fn run_args_place_env_before_entrypoint_and_image() {
+        let mut s = spec("u1");
+        s.env = vec![("K".to_string(), "V".to_string())];
+        s.command = vec!["cmd".to_string()];
+        let got = build_run_args("velos-u1", &s);
+        assert_eq!(
+            got,
+            vec![
+                "run",
+                "--detach",
+                "--name",
+                "velos-u1",
+                "--env",
+                "K=V",
+                "--entrypoint",
+                "cmd",
+                "alpine"
+            ]
+        );
     }
 
     #[test]
