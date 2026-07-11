@@ -51,8 +51,11 @@ export function Workers() {
                     </div>
                     <div className="min-w-0">
                       <div className="truncate font-medium text-zinc-100">{w.metadata.name}</div>
-                      <div className="text-[11px] text-zinc-500">
-                        {w.status?.containerRuntimeVersion ?? "unknown runtime"}
+                      <div className="truncate text-[11px] text-zinc-500">
+                        {w.status?.nodeInfo?.agentVersion
+                          ? `veloslet ${w.status.nodeInfo.agentVersion}`
+                          : "unknown agent"}
+                        {w.status?.nodeInfo?.os ? ` · ${w.status.nodeInfo.os}` : ""}
                       </div>
                     </div>
                   </div>
@@ -135,6 +138,7 @@ function WorkerDrawer({
   if (!worker) return <Drawer open={false} onClose={onClose} title="" children={null} />;
   const ready = isWorkerReady(worker);
   const lease = leaseFor(leases, worker.metadata.name);
+  const info = worker.status?.nodeInfo;
   const onNode = containers.filter((c) => c.spec.nodeName === worker.metadata.name);
 
   return (
@@ -148,6 +152,10 @@ function WorkerDrawer({
         <Field label="Status">
           <StatusDot ok={ready} label={ready ? "Ready" : "NotReady"} />
         </Field>
+        <Field label="Agent">{info?.agentVersion ? `veloslet ${info.agentVersion}` : "unknown"}</Field>
+        <Field label="OS">{info?.os || "unknown"}</Field>
+        <Field label="Arch">{info?.arch || "unknown"}</Field>
+        <Field label="Hostname">{info?.hostname || "unknown"}</Field>
         <Field label="Runtime">{worker.status?.containerRuntimeVersion ?? "unknown"}</Field>
         <Field label="Schedulable">{worker.spec.unschedulable ? "No (cordoned)" : "Yes"}</Field>
         <Field label="Capacity">
@@ -156,6 +164,7 @@ function WorkerDrawer({
         <Field label="Addresses">
           {worker.status?.addresses?.length ? worker.status.addresses.join(", ") : "—"}
         </Field>
+        <Field label="Last seen">{lease ? `${ageFrom(lease.spec.renewTime)} ago` : "never"}</Field>
         <Field label="Lease">
           {lease ? (
             <>

@@ -407,7 +407,18 @@ async fn delete(
     }
 
     match state.store.delete(kind, &name)? {
-        Some(_) => Ok(StatusCode::NO_CONTENT.into_response()),
+        Some(_) => {
+            // Removing a worker also revokes its per-worker credential, so a
+            // deleted worker cannot keep heartbeating or silently re-register.
+            // Best-effort: a revoke failure is logged, not surfaced as an error.
+            if kind == "Worker"
+                && let Some(auth) = state.auth.as_ref()
+                && let Err(e) = auth.revoke_credential(&name)
+            {
+                tracing::warn!("failed to revoke credential for deleted worker {name}: {e}");
+            }
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
         None => Err(ApiError::NotFound),
     }
 }
@@ -426,7 +437,7 @@ fn bearer(headers: &HeaderMap) -> Option<String> {
 }
 
 /// `POST /auth/v1/tokens` — mint a worker bootstrap token (admin-only).
-/// Body: `{ "ttlSeconds": N }`.
+/// Body: `{ "label"?: "...", "ttlSeconds"?: N }`.
 async fn mint_token(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -434,17 +445,60 @@ async fn mint_token(
 ) -> Result<Json<Value>, ApiError> {
     let auth = state.auth.as_ref().ok_or(ApiError::NotFound)?;
     require_admin(auth, &headers)?;
+    let body = body.map(|Json(b)| b).unwrap_or_default();
+    let label = body
+        .get("label")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
     let ttl = body
-        .and_then(|Json(b)| b.get("ttlSeconds").and_then(Value::as_i64))
+        .get("ttlSeconds")
+        .and_then(Value::as_i64)
         .unwrap_or(24 * 3600);
     let tok = auth
-        .mint_bootstrap_token(ttl)
+        .mint_bootstrap_token(label, ttl)
         .map_err(|e| ApiError::Internal(e.to_string()))?;
     Ok(Json(serde_json::json!({
         "tokenId": tok.token_id,
         "secret": tok.secret.expose(),
         "expiresAt": tok.expires_at.to_rfc3339(),
     })))
+}
+
+/// `GET /auth/v1/tokens` — list bootstrap-token metadata (admin-only).
+async fn list_bootstrap_tokens(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    let auth = state.auth.as_ref().ok_or(ApiError::NotFound)?;
+    require_admin(auth, &headers)?;
+    let items = auth
+        .list_bootstrap_tokens()
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    let items: Vec<Value> = items
+        .into_iter()
+        .map(|t| {
+            serde_json::json!({
+                "id": t.id,
+                "label": t.label,
+                "createdAt": t.created_at,
+                "expiresAt": t.expires_at,
+            })
+        })
+        .collect();
+    Ok(Json(serde_json::json!({ "items": items })))
+}
+
+/// `DELETE /auth/v1/tokens/{id}` — revoke a bootstrap token (admin-only).
+async fn revoke_bootstrap_token(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let auth = state.auth.as_ref().ok_or(ApiError::NotFound)?;
+    require_admin(auth, &headers)?;
+    auth.revoke_bootstrap_token(&id)
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    Ok(Json(serde_json::json!({ "revoked": id })))
 }
 
 /// `POST /auth/v1/register` — join with a bootstrap token, get a credential.
@@ -475,6 +529,16 @@ async fn register(
         .get("containerRuntimeVersion")
         .cloned()
         .unwrap_or_else(|| serde_json::json!("unknown"));
+    // Older agents may omit nodeInfo; default every field to "unknown" so the
+    // status shape is stable for clients.
+    let node_info = req.get("nodeInfo").cloned().unwrap_or_else(|| {
+        serde_json::json!({
+            "agentVersion": "unknown",
+            "os": "unknown",
+            "arch": "unknown",
+            "hostname": "unknown",
+        })
+    });
 
     let uid = Uuid::new_v4();
     let rv = state.store.next_resource_version()?;
@@ -487,6 +551,7 @@ async fn register(
             "conditions": [],
             "addresses": addresses,
             "containerRuntimeVersion": runtime_version,
+            "nodeInfo": node_info,
         }
     });
     stamp_meta(&mut doc, &uid, rv);
@@ -790,7 +855,14 @@ pub fn app_with_auth(store: Arc<dyn Store>, auth: Arc<dyn AuthService>) -> Route
             "/auth/v1/admin/tokens/{id}",
             axum::routing::delete(revoke_token),
         )
-        .route("/auth/v1/tokens", post(mint_token))
+        .route(
+            "/auth/v1/tokens",
+            get(list_bootstrap_tokens).post(mint_token),
+        )
+        .route(
+            "/auth/v1/tokens/{id}",
+            axum::routing::delete(revoke_bootstrap_token),
+        )
         .route("/auth/v1/register", post(register))
         .merge(protected)
         .fallback(serve_ui)

@@ -27,6 +27,12 @@ pub fn detect_host() -> Result<HostResources> {
 }
 
 fn sysctl_u64(key: &str) -> Result<u64> {
+    let text = sysctl_string(key)?;
+    text.parse::<u64>()
+        .with_context(|| format!("parsing sysctl {key} output {text:?}"))
+}
+
+fn sysctl_string(key: &str) -> Result<String> {
     let out = Command::new("sysctl")
         .args(["-n", key])
         .output()
@@ -36,9 +42,33 @@ fn sysctl_u64(key: &str) -> Result<u64> {
     }
     let text =
         String::from_utf8(out.stdout).with_context(|| format!("sysctl {key} output not UTF-8"))?;
-    text.trim()
-        .parse::<u64>()
-        .with_context(|| format!("parsing sysctl {key} output {:?}", text.trim()))
+    Ok(text.trim().to_string())
+}
+
+/// Identifying facts about the worker's OS and agent build, reported at
+/// registration for fleet visibility (agent version, OS, arch, hostname).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SystemInfo {
+    pub agent_version: String,
+    pub os: String,
+    pub arch: String,
+    pub hostname: String,
+}
+
+/// Collect host system info for registration. Best-effort (Principle #6 applies
+/// to *auth*, not cosmetics): a field that cannot be read falls back to a
+/// placeholder rather than aborting a worker's registration.
+pub fn detect_system_info() -> SystemInfo {
+    let os = match sysctl_string("kern.osproductversion") {
+        Ok(v) => format!("macOS {v}"),
+        Err(_) => "macOS".to_string(),
+    };
+    SystemInfo {
+        agent_version: env!("CARGO_PKG_VERSION").to_string(),
+        os,
+        arch: sysctl_string("hw.machine").unwrap_or_else(|_| "unknown".to_string()),
+        hostname: sysctl_string("kern.hostname").unwrap_or_else(|_| "unknown".to_string()),
+    }
 }
 
 /// Reject capacity that exceeds the physical host or is degenerate. Fail closed.

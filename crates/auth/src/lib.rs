@@ -109,10 +109,16 @@ pub struct BootstrapToken {
 /// Auth operations the server depends on. A trait so the implementation
 /// (SQLite-backed today) is swappable behind a deep-module seam.
 pub trait AuthService: Send + Sync {
-    /// Mint a bootstrap token valid for `ttl_secs`; persists only its hash.
-    fn mint_bootstrap_token(&self, ttl_secs: i64) -> Result<BootstrapToken, AuthError>;
+    /// Mint a bootstrap token valid for `ttl_secs`; persists only its hash,
+    /// plus its `label` and creation time so it can later be listed.
+    fn mint_bootstrap_token(&self, label: &str, ttl_secs: i64)
+    -> Result<BootstrapToken, AuthError>;
     /// Verify a presented `id.secret` bootstrap token, failing closed.
     fn verify_bootstrap(&self, presented: &str) -> Result<(), AuthError>;
+    /// List bootstrap-token metadata (never the secrets).
+    fn list_bootstrap_tokens(&self) -> Result<Vec<BootstrapTokenSummary>, AuthError>;
+    /// Revoke a bootstrap token by id; further registrations with it fail closed.
+    fn revoke_bootstrap_token(&self, id: &str) -> Result<(), AuthError>;
     /// Issue a long-lived worker credential (`worker.secret`); persists its hash.
     fn issue_credential(&self, worker: &str) -> Result<String, AuthError>;
     /// Authenticate a presented `worker.secret` credential; `None` = rejected.
@@ -150,6 +156,15 @@ pub struct AdminTokenInfo {
     pub id: String,
     pub label: String,
     pub kind: String,
+    pub created_at: String,
+    pub expires_at: String,
+}
+
+/// Listable metadata for a bootstrap (join) token. Never carries the secret.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BootstrapTokenSummary {
+    pub id: String,
+    pub label: String,
     pub created_at: String,
     pub expires_at: String,
 }
@@ -239,15 +254,22 @@ fn split_credential(presented: &str) -> Option<(&str, Secret)> {
 }
 
 impl AuthService for StoreAuthenticator {
-    fn mint_bootstrap_token(&self, ttl_secs: i64) -> Result<BootstrapToken, AuthError> {
+    fn mint_bootstrap_token(
+        &self,
+        label: &str,
+        ttl_secs: i64,
+    ) -> Result<BootstrapToken, AuthError> {
         let token_id = Uuid::new_v4().simple().to_string();
         let secret = Secret::generate();
-        let expires_at = Utc::now() + Duration::seconds(ttl_secs);
+        let now = Utc::now();
+        let expires_at = now + Duration::seconds(ttl_secs);
         self.write(
             KIND_TOKEN,
             &token_id,
             serde_json::json!({
                 "secretHash": secret.hash(),
+                "label": label,
+                "createdAt": now.to_rfc3339(),
                 "expiresAt": expires_at.to_rfc3339(),
             }),
         )?;
@@ -256,6 +278,24 @@ impl AuthService for StoreAuthenticator {
             secret,
             expires_at,
         })
+    }
+
+    fn list_bootstrap_tokens(&self) -> Result<Vec<BootstrapTokenSummary>, AuthError> {
+        let objs = self.store.list(KIND_TOKEN, &Selector::default())?;
+        Ok(objs
+            .into_iter()
+            .map(|o| BootstrapTokenSummary {
+                id: o.name,
+                label: str_field(&o.document, "label"),
+                created_at: str_field(&o.document, "createdAt"),
+                expires_at: str_field(&o.document, "expiresAt"),
+            })
+            .collect())
+    }
+
+    fn revoke_bootstrap_token(&self, id: &str) -> Result<(), AuthError> {
+        self.store.delete(KIND_TOKEN, id)?;
+        Ok(())
     }
 
     fn verify_bootstrap(&self, presented: &str) -> Result<(), AuthError> {
@@ -413,7 +453,7 @@ mod tests {
     #[test]
     fn bootstrap_token_round_trip_then_expiry() {
         let a = auth();
-        let tok = a.mint_bootstrap_token(60).unwrap();
+        let tok = a.mint_bootstrap_token("fleet-a", 60).unwrap();
         let presented = format!("{}.{}", tok.token_id, tok.secret.expose());
         assert!(a.verify_bootstrap(&presented).is_ok());
 
@@ -422,12 +462,39 @@ mod tests {
         assert!(matches!(a.verify_bootstrap(&bad), Err(AuthError::Invalid)));
 
         // expired token fails closed
-        let expired = a.mint_bootstrap_token(-1).unwrap();
+        let expired = a.mint_bootstrap_token("", -1).unwrap();
         let presented = format!("{}.{}", expired.token_id, expired.secret.expose());
         assert!(matches!(
             a.verify_bootstrap(&presented),
             Err(AuthError::Expired)
         ));
+    }
+
+    #[test]
+    fn bootstrap_tokens_list_carries_label_and_revoke_fails_closed() {
+        let a = auth();
+        let tok = a.mint_bootstrap_token("fleet-a", 60).unwrap();
+        let presented = format!("{}.{}", tok.token_id, tok.secret.expose());
+
+        // listing shows the token's metadata, never the secret
+        let listed = a.list_bootstrap_tokens().unwrap();
+        let entry = listed.iter().find(|t| t.id == tok.token_id).unwrap();
+        assert_eq!(entry.label, "fleet-a");
+        assert!(!entry.expires_at.is_empty());
+        assert!(!entry.created_at.is_empty());
+
+        // revoke -> verification fails closed and it drops out of the listing
+        a.revoke_bootstrap_token(&tok.token_id).unwrap();
+        assert!(matches!(
+            a.verify_bootstrap(&presented),
+            Err(AuthError::Invalid)
+        ));
+        assert!(
+            a.list_bootstrap_tokens()
+                .unwrap()
+                .iter()
+                .all(|t| t.id != tok.token_id)
+        );
     }
 
     #[test]

@@ -8,7 +8,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use velos_runtime::{AppleContainer, ContainerRuntime};
 use veloslet::daemon::{self, BUNDLE_EXECUTABLE, BUNDLE_ID, WorkerConfig};
-use veloslet::host::{detect_host, validate_capacity};
+use veloslet::host::{detect_host, detect_system_info, validate_capacity};
 use veloslet::memory::Memory;
 use veloslet::{ApiClient, run_loop};
 
@@ -221,11 +221,18 @@ async fn run(cfg: WorkerConfig) -> Result<()> {
 
     // Register with the bootstrap token to obtain a worker credential.
     let boot = ApiClient::new(&cfg.server, Some(cfg.token.clone()));
+    let sys = detect_system_info();
     let request = serde_json::json!({
         "name": cfg.node,
         "capacity": { "cpu": cfg.cpu, "memoryBytes": cfg.memory.bytes() },
         "addresses": [],
         "containerRuntimeVersion": runtime_version,
+        "nodeInfo": {
+            "agentVersion": sys.agent_version,
+            "os": sys.os,
+            "arch": sys.arch,
+            "hostname": sys.hostname,
+        },
     });
     // Retry registration in-process instead of exiting on failure. This keeps a
     // long-lived process alive so macOS can attribute (and the user can approve)

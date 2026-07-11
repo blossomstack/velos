@@ -199,3 +199,233 @@ async fn admin_auth_end_to_end() {
         .unwrap();
     assert!(reg.status().is_success());
 }
+
+/// First-run setup, then login for a session token.
+async fn setup_and_login(http: &reqwest::Client, base: &str) -> String {
+    http.post(format!("{base}/auth/v1/setup"))
+        .json(&serde_json::json!({ "username": "admin", "password": "pw" }))
+        .send()
+        .await
+        .unwrap();
+    http.post(format!("{base}/auth/v1/login"))
+        .json(&serde_json::json!({ "username": "admin", "password": "pw" }))
+        .send()
+        .await
+        .unwrap()
+        .json::<serde_json::Value>()
+        .await
+        .unwrap()["token"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+/// Admin-mint a labelled bootstrap token; returns the raw mint response JSON.
+async fn mint_bootstrap(
+    http: &reqwest::Client,
+    base: &str,
+    session: &str,
+    label: &str,
+) -> serde_json::Value {
+    http.post(format!("{base}/auth/v1/tokens"))
+        .bearer_auth(session)
+        .json(&serde_json::json!({ "label": label, "ttlSeconds": 3600 }))
+        .send()
+        .await
+        .unwrap()
+        .json::<serde_json::Value>()
+        .await
+        .unwrap()
+}
+
+fn joined(mint: &serde_json::Value) -> String {
+    format!(
+        "{}.{}",
+        mint["tokenId"].as_str().unwrap(),
+        mint["secret"].as_str().unwrap()
+    )
+}
+
+#[tokio::test]
+async fn worker_registration_round_trips_node_info() {
+    let base = start_auth().await;
+    let http = reqwest::Client::new();
+    let session = setup_and_login(&http, &base).await;
+    let boot_tok = joined(&mint_bootstrap(&http, &base, &session, "fleet").await);
+
+    // Register a worker that reports full system info.
+    http.post(format!("{base}/auth/v1/register"))
+        .bearer_auth(&boot_tok)
+        .json(&serde_json::json!({
+            "name": "w1",
+            "capacity": { "cpu": 4, "memoryBytes": 8589934592u64 },
+            "addresses": [],
+            "containerRuntimeVersion": "1.2.3",
+            "nodeInfo": {
+                "agentVersion": "0.9.9",
+                "os": "macOS 15.1",
+                "arch": "arm64",
+                "hostname": "mac-01"
+            }
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    let w = http
+        .get(format!("{base}/api/v1/workers/w1"))
+        .bearer_auth(&session)
+        .send()
+        .await
+        .unwrap()
+        .json::<serde_json::Value>()
+        .await
+        .unwrap();
+    assert_eq!(w["status"]["nodeInfo"]["agentVersion"], "0.9.9");
+    assert_eq!(w["status"]["nodeInfo"]["os"], "macOS 15.1");
+    assert_eq!(w["status"]["nodeInfo"]["arch"], "arm64");
+    assert_eq!(w["status"]["nodeInfo"]["hostname"], "mac-01");
+
+    // An older agent that omits nodeInfo still gets a stable "unknown" block.
+    http.post(format!("{base}/auth/v1/register"))
+        .bearer_auth(&boot_tok)
+        .json(&serde_json::json!({ "name": "w2" }))
+        .send()
+        .await
+        .unwrap();
+    let w2 = http
+        .get(format!("{base}/api/v1/workers/w2"))
+        .bearer_auth(&session)
+        .send()
+        .await
+        .unwrap()
+        .json::<serde_json::Value>()
+        .await
+        .unwrap();
+    assert_eq!(w2["status"]["nodeInfo"]["agentVersion"], "unknown");
+    assert_eq!(w2["status"]["nodeInfo"]["hostname"], "unknown");
+}
+
+#[tokio::test]
+async fn deleting_worker_revokes_its_credential() {
+    let base = start_auth().await;
+    let http = reqwest::Client::new();
+    let session = setup_and_login(&http, &base).await;
+    let boot_tok = joined(&mint_bootstrap(&http, &base, &session, "fleet").await);
+
+    let cred = http
+        .post(format!("{base}/auth/v1/register"))
+        .bearer_auth(&boot_tok)
+        .json(&serde_json::json!({ "name": "w1" }))
+        .send()
+        .await
+        .unwrap()
+        .json::<serde_json::Value>()
+        .await
+        .unwrap()["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // The freshly issued credential authenticates against the worker's own object.
+    let r = http
+        .get(format!("{base}/api/v1/workers/w1"))
+        .bearer_auth(&cred)
+        .send()
+        .await
+        .unwrap();
+    assert!(r.status().is_success());
+
+    // Admin deletes the worker.
+    let r = http
+        .delete(format!("{base}/api/v1/workers/w1"))
+        .bearer_auth(&session)
+        .send()
+        .await
+        .unwrap();
+    assert!(r.status().is_success());
+
+    // The per-worker credential is now revoked and fails closed.
+    let r = http
+        .get(format!("{base}/api/v1/workers/w1"))
+        .bearer_auth(&cred)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), reqwest::StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn bootstrap_tokens_list_and_revoke() {
+    let base = start_auth().await;
+    let http = reqwest::Client::new();
+    let session = setup_and_login(&http, &base).await;
+
+    // Listing is admin-gated.
+    let r = http
+        .get(format!("{base}/auth/v1/tokens"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+    let mint = mint_bootstrap(&http, &base, &session, "fleet-a").await;
+    let id = mint["tokenId"].as_str().unwrap().to_string();
+    let boot_tok = joined(&mint);
+
+    // The token shows in the admin listing with its label and never its secret.
+    let listed = http
+        .get(format!("{base}/auth/v1/tokens"))
+        .bearer_auth(&session)
+        .send()
+        .await
+        .unwrap()
+        .json::<serde_json::Value>()
+        .await
+        .unwrap();
+    let entry = listed["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["id"] == serde_json::json!(id))
+        .unwrap()
+        .clone();
+    assert_eq!(entry["label"], "fleet-a");
+    assert!(entry.get("secret").is_none());
+    assert!(entry.get("secretHash").is_none());
+
+    // Revoke it: registration with it now fails closed and it leaves the list.
+    let r = http
+        .delete(format!("{base}/auth/v1/tokens/{id}"))
+        .bearer_auth(&session)
+        .send()
+        .await
+        .unwrap();
+    assert!(r.status().is_success());
+
+    let reg = http
+        .post(format!("{base}/auth/v1/register"))
+        .bearer_auth(&boot_tok)
+        .json(&serde_json::json!({ "name": "w1" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(reg.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+    let listed = http
+        .get(format!("{base}/auth/v1/tokens"))
+        .bearer_auth(&session)
+        .send()
+        .await
+        .unwrap()
+        .json::<serde_json::Value>()
+        .await
+        .unwrap();
+    assert!(
+        listed["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|t| t["id"] != serde_json::json!(id))
+    );
+}

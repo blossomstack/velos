@@ -65,12 +65,20 @@ export interface WorkerCondition {
   reason?: string;
 }
 
+export interface NodeSystemInfo {
+  agentVersion?: string;
+  os?: string;
+  arch?: string;
+  hostname?: string;
+}
+
 export interface WorkerStatus {
   capacity?: Capacity;
   allocatable?: Capacity;
   conditions?: WorkerCondition[];
   addresses?: string[];
   containerRuntimeVersion?: string;
+  nodeInfo?: NodeSystemInfo;
 }
 
 export interface Worker {

@@ -151,3 +151,42 @@ export function useRevokeToken() {
     onSuccess: () => qc.invalidateQueries({ queryKey: ["admin-tokens"] }),
   });
 }
+
+// ── Join (bootstrap) tokens ────────────────────────────────────────────────
+// Workers present these once to register. They hit /auth/v1/tokens (not under
+// /api/v1), so they call sendAuth directly.
+
+export interface JoinToken {
+  id: string;
+  label: string;
+  createdAt: string;
+  expiresAt: string;
+}
+
+export function useJoinTokens() {
+  return useQuery({
+    queryKey: ["join-tokens"],
+    queryFn: () => sendAuth<{ items: JoinToken[] }>("/auth/v1/tokens", {}),
+    select: (d) => d.items ?? [],
+  });
+}
+
+export function useCreateJoinToken() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (t: { label: string; ttlSeconds: number }) =>
+      sendAuth<{ tokenId: string; secret: string; expiresAt: string }>("/auth/v1/tokens", {
+        method: "POST",
+        body: JSON.stringify({ label: t.label, ttlSeconds: t.ttlSeconds }),
+      }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["join-tokens"] }),
+  });
+}
+
+export function useRevokeJoinToken() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (id: string) => sendAuth<void>(`/auth/v1/tokens/${id}`, { method: "DELETE" }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["join-tokens"] }),
+  });
+}

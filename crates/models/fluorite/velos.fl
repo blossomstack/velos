@@ -76,12 +76,20 @@ struct WorkerSpec {
     unschedulable: bool,
 }
 
+struct NodeSystemInfo {
+    agent_version: String,
+    os: String,
+    arch: String,
+    hostname: String,
+}
+
 struct WorkerStatus {
     capacity: NodeResources,
     allocatable: NodeResources,
     conditions: Vec<NodeCondition>,
     addresses: Vec<String>,
     container_runtime_version: String,
+    node_info: NodeSystemInfo,
 }
 
 struct Worker {
@@ -114,6 +122,7 @@ struct RegisterRequest {
     capacity: NodeResources,
     addresses: Vec<String>,
     container_runtime_version: String,
+    node_info: NodeSystemInfo,
 }
 
 struct WorkerCredential {
