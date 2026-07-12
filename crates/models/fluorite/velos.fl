@@ -31,6 +31,45 @@ struct ResourceReqs {
     memory_bytes: u64,
 }
 
+enum NodeSelectorOperator { In, NotIn, Exists, DoesNotExist, Gt, Lt }
+
+struct NodeSelectorRequirement {
+    key: String,
+    operator: NodeSelectorOperator,
+    values: Vec<String>,
+}
+
+struct NodeSelectorTerm {
+    match_expressions: Vec<NodeSelectorRequirement>,
+}
+
+struct PreferredSchedulingTerm {
+    weight: i32,
+    preference: NodeSelectorTerm,
+}
+
+struct NodeAffinity {
+    required: Vec<NodeSelectorTerm>,
+    preferred: Vec<PreferredSchedulingTerm>,
+}
+
+enum TaintEffect { NoSchedule, PreferNoSchedule }
+
+struct Taint {
+    key: String,
+    value: String,
+    effect: TaintEffect,
+}
+
+enum TolerationOperator { Equal, Exists }
+
+struct Toleration {
+    key: String,
+    operator: TolerationOperator,
+    value: String,
+    effect: Option<TaintEffect>,
+}
+
 struct ContainerSpec {
     image: String,
     command: Vec<String>,
@@ -38,6 +77,9 @@ struct ContainerSpec {
     resources: ResourceReqs,
     restart_policy: RestartPolicy,
     node_name: Option<String>,
+    node_selector: Map<String, String>,
+    affinity: Option<NodeAffinity>,
+    tolerations: Vec<Toleration>,
 }
 
 struct ContainerStatus {
@@ -74,6 +116,7 @@ struct NodeCondition {
 
 struct WorkerSpec {
     unschedulable: bool,
+    taints: Vec<Taint>,
 }
 
 struct NodeSystemInfo {

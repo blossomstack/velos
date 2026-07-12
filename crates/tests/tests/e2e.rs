@@ -82,7 +82,7 @@ async fn container_runs_through_full_lifecycle() {
     let bound = controllers::reconcile_scheduling(store.as_ref()).unwrap();
     assert_eq!(bound, 1);
     let c = get_container(&http, &base, "c1").await;
-    assert_eq!(c["spec"]["nodeName"], "w1");
+    assert_eq!(c["status"]["workerName"], "w1");
     assert_eq!(c["status"]["phase"], "Scheduled");
     let uid = c["metadata"]["uid"].as_str().unwrap().to_string();
 
@@ -427,5 +427,122 @@ async fn bootstrap_tokens_list_and_revoke() {
             .unwrap()
             .iter()
             .all(|t| t["id"] != serde_json::json!(id))
+    );
+}
+
+#[tokio::test]
+async fn pins_and_selectors_place_containers() {
+    let (base, store) = start().await;
+    let http = reqwest::Client::new();
+
+    // Two ready workers; w-gpu is labeled + tainted.
+    for (name, labels, taints) in [
+        ("w-plain", serde_json::json!({}), serde_json::json!([])),
+        (
+            "w-gpu",
+            serde_json::json!({ "gpu": "true" }),
+            serde_json::json!([{ "key": "gpu", "value": "true", "effect": "NoSchedule" }]),
+        ),
+    ] {
+        post(
+            &http,
+            &base,
+            "workers",
+            serde_json::json!({
+                "metadata": { "name": name, "labels": labels },
+                "spec": { "unschedulable": false, "taints": taints },
+                "status": {
+                    "allocatable": { "cpu": 8, "memoryBytes": 17179869184u64 },
+                    "conditions": [{ "conditionType": "Ready", "status": true,
+                        "lastTransitionTime": "2026-07-11T00:00:00Z", "reason": "LeaseRenewed" }],
+                }
+            }),
+        )
+        .await;
+    }
+
+    // (a) nodeSelector gpu=true + toleration -> must land on w-gpu.
+    post(
+        &http,
+        &base,
+        "containers",
+        serde_json::json!({
+            "metadata": { "name": "c-gpu" },
+            "spec": { "image": "img", "resources": { "cpu": 1, "memoryBytes": 1024 },
+                "restartPolicy": "Never", "nodeSelector": { "gpu": "true" },
+                "tolerations": [{ "key": "gpu", "operator": "Exists" }] },
+            "status": { "phase": "Pending" }
+        }),
+    )
+    .await;
+
+    // (b) pin to w-plain.
+    post(
+        &http,
+        &base,
+        "containers",
+        serde_json::json!({
+            "metadata": { "name": "c-pin" },
+            "spec": { "image": "img", "resources": { "cpu": 1, "memoryBytes": 1024 },
+                "restartPolicy": "Never", "nodeName": "w-plain" },
+            "status": { "phase": "Pending" }
+        }),
+    )
+    .await;
+
+    controllers::reconcile_scheduling(&*store).unwrap();
+
+    let c_gpu = get_container(&http, &base, "c-gpu").await;
+    assert_eq!(c_gpu["status"]["workerName"], serde_json::json!("w-gpu"));
+    let c_pin = get_container(&http, &base, "c-pin").await;
+    assert_eq!(c_pin["status"]["workerName"], serde_json::json!("w-plain"));
+}
+
+#[tokio::test]
+async fn untolerated_taint_leaves_container_pending_with_reason() {
+    let (base, store) = start().await;
+    let http = reqwest::Client::new();
+
+    post(
+        &http,
+        &base,
+        "workers",
+        serde_json::json!({
+            "metadata": { "name": "w-tainted", "labels": {} },
+            "spec": { "unschedulable": false,
+                "taints": [{ "key": "gpu", "value": "true", "effect": "NoSchedule" }] },
+            "status": {
+                "allocatable": { "cpu": 8, "memoryBytes": 17179869184u64 },
+                "conditions": [{ "conditionType": "Ready", "status": true,
+                    "lastTransitionTime": "2026-07-11T00:00:00Z", "reason": "LeaseRenewed" }],
+            }
+        }),
+    )
+    .await;
+
+    post(
+        &http,
+        &base,
+        "containers",
+        serde_json::json!({
+            "metadata": { "name": "c-notol" },
+            "spec": { "image": "img", "resources": { "cpu": 1, "memoryBytes": 1024 },
+                "restartPolicy": "Never" },
+            "status": { "phase": "Pending" }
+        }),
+    )
+    .await;
+
+    controllers::reconcile_scheduling(&*store).unwrap();
+
+    let c = get_container(&http, &base, "c-notol").await;
+    assert_eq!(c["status"]["phase"], serde_json::json!("Pending"));
+    assert!(
+        c["status"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("untolerated taint"),
+        "message was: {}",
+        c["status"]["message"]
     );
 }

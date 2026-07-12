@@ -46,7 +46,10 @@ impl Container {
                 HashMap::new(),
                 ResourceReqs::new(1, 512 * 1024 * 1024),
                 RestartPolicy::Never,
-                None,
+                None,           // node_name
+                HashMap::new(), // node_selector
+                None,           // affinity
+                Vec::new(),     // tolerations
             ),
             ContainerStatus::new(ContainerPhase::Pending, None, None, None, None, None, None),
         )
@@ -67,6 +70,18 @@ mod tests {
         assert!(json.contains("\"creationTimestamp\""), "json was: {json}");
         assert!(json.contains("\"restartPolicy\""), "json was: {json}");
 
+        let back: Container = serde_json::from_str(&json).unwrap();
+        assert_eq!(c, back);
+    }
+
+    #[test]
+    fn container_spec_carries_placement_fields_in_camel_case() {
+        let c = Container::pending("c1", "alpine:latest");
+        let json = serde_json::to_string(&c).unwrap();
+        assert!(json.contains("\"nodeSelector\""), "json was: {json}");
+        assert!(json.contains("\"tolerations\""), "json was: {json}");
+        // `affinity` is Option and omitted when None (like nodeName); the
+        // round-trip below proves the field exists and deserializes.
         let back: Container = serde_json::from_str(&json).unwrap();
         assert_eq!(c, back);
     }

@@ -61,10 +61,10 @@ impl ApiClient {
         serde_json::from_str(&text).map_err(|e| ClientError::Http(e.to_string()))
     }
 
-    /// List containers assigned to `node` (`fieldSelector=spec.nodeName=node`).
+    /// List containers bound to `node` (`fieldSelector=status.workerName=node`).
     pub async fn list_assigned(&self, node: &str) -> Result<Vec<Value>, ClientError> {
         let url = format!(
-            "{}/api/v1/containers?fieldSelector=spec.nodeName={node}",
+            "{}/api/v1/containers?fieldSelector=status.workerName={node}",
             self.base
         );
         let body = self.send(self.http.get(url)).await?;

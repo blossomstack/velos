@@ -51,6 +51,37 @@ under `/api/v1/{plural}`:
 - **Lease** — a worker's periodic heartbeat; a stale lease marks its worker
   `NotReady`.
 
+## Placement
+
+By default the scheduler first-fits a container onto any ready worker with room.
+A container's `spec` can constrain **where** it runs (Kubernetes-shaped):
+
+- **`nodeName`** — pin to one worker by name.
+- **`nodeSelector`** — require the worker to carry matching `metadata.labels`.
+- **`affinity`** — richer node affinity: hard `required` terms (operators `In`,
+  `NotIn`, `Exists`, `DoesNotExist`, `Gt`, `Lt`) and soft, weighted `preferred`
+  terms that influence scoring.
+- **`tolerations`** — allow scheduling onto workers whose `spec.taints`
+  (`NoSchedule` / `PreferNoSchedule`) would otherwise repel the container.
+
+The scheduler **filters** on the hard constraints, **scores** the survivors by the
+soft preferences, and picks the best (ties break by input order, so an
+unconstrained container behaves exactly like first-fit). A container that no
+worker can satisfy stays `Pending` with a human-readable `status.message`. Once
+bound, the placement is recorded in `status.workerName` and never re-evaluated.
+
+```jsonc
+// run only on GPU workers, preferring the "us" zone, tolerating the gpu taint
+"spec": {
+  "image": "…",
+  "nodeSelector": { "gpu": "true" },
+  "affinity": { "preferred": [
+    { "weight": 50, "preference": { "matchExpressions": [
+      { "key": "zone", "operator": "In", "values": ["us"] } ] } } ] },
+  "tolerations": [ { "key": "gpu", "operator": "Exists" } ]
+}
+```
+
 ## Getting started
 
 Install with cargo:

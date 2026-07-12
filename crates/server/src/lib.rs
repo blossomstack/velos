@@ -1,7 +1,7 @@
 //! Velos API server: a Kubernetes-shaped REST surface over `velos_store`.
 //!
 //! Objects are handled as opaque JSON; only the indexed envelope fields
-//! (`metadata.name`, `metadata.labels`, `spec.nodeName`) are interpreted.
+//! (`metadata.name`, `metadata.labels`, `status.workerName`) are interpreted.
 //! Typed admission against `velos-models` is a later phase.
 
 pub mod controllers;
@@ -108,11 +108,126 @@ fn extract_labels(doc: &Value) -> HashMap<String, String> {
     out
 }
 
+/// The `node_name` index column tracks the **bound** worker — i.e. the actual
+/// placement in `status.workerName`, not the user's desired `spec.nodeName` pin.
 fn extract_node_name(doc: &Value) -> Option<String> {
-    doc.get("spec")?
-        .get("nodeName")?
+    doc.get("status")?
+        .get("workerName")?
         .as_str()
         .map(str::to_string)
+}
+
+/// Admission (fail closed): reject malformed placement in a Container/Worker
+/// spec, rather than letting the scheduler silently skip the bad expression.
+fn validate_placement(kind: &str, doc: &Value) -> Result<(), ApiError> {
+    let Some(spec) = doc.get("spec") else {
+        return Ok(());
+    };
+
+    if kind == "Container" {
+        if let Some(aff) = spec.get("affinity").filter(|v| v.is_object()) {
+            for term in aff
+                .get("required")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                validate_term(term)?;
+            }
+            for p in aff
+                .get("preferred")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                let weight = p.get("weight").and_then(Value::as_i64).ok_or_else(|| {
+                    ApiError::BadRequest("preferred term requires integer weight".into())
+                })?;
+                if !(1..=100).contains(&weight) {
+                    return Err(ApiError::BadRequest(
+                        "preferred weight must be 1..=100".into(),
+                    ));
+                }
+                if let Some(pref) = p.get("preference") {
+                    validate_term(pref)?;
+                }
+            }
+        }
+        for t in spec
+            .get("tolerations")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            match t.get("operator").and_then(Value::as_str) {
+                Some("Equal") | Some("Exists") | None => {}
+                Some(op) => {
+                    return Err(ApiError::BadRequest(format!(
+                        "bad toleration operator: {op}"
+                    )));
+                }
+            }
+        }
+    }
+
+    if kind == "Worker" {
+        for t in spec
+            .get("taints")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            if t.get("key")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .is_empty()
+            {
+                return Err(ApiError::BadRequest(
+                    "taint requires a non-empty key".into(),
+                ));
+            }
+            match t.get("effect").and_then(Value::as_str) {
+                Some("NoSchedule") | Some("PreferNoSchedule") => {}
+                other => {
+                    return Err(ApiError::BadRequest(format!("bad taint effect: {other:?}")));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_term(term: &Value) -> Result<(), ApiError> {
+    for e in term
+        .get("matchExpressions")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let op = e
+            .get("operator")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ApiError::BadRequest("matchExpression requires operator".into()))?;
+        match op {
+            "In" | "NotIn" | "Exists" | "DoesNotExist" => {}
+            "Gt" | "Lt" => {
+                let ok = e
+                    .get("values")
+                    .and_then(Value::as_array)
+                    .and_then(|a| a.first())
+                    .and_then(Value::as_str)
+                    .map(|s| s.parse::<i64>().is_ok())
+                    .unwrap_or(false);
+                if !ok {
+                    return Err(ApiError::BadRequest(format!(
+                        "{op} requires one integer value"
+                    )));
+                }
+            }
+            other => return Err(ApiError::BadRequest(format!("bad operator: {other}"))),
+        }
+    }
+    Ok(())
 }
 
 /// Stamps server-owned envelope fields into a (mutable) object document.
@@ -148,7 +263,9 @@ fn parse_selector(params: &HashMap<String, String>) -> Result<Selector, ApiError
             let (k, v) = pair
                 .split_once('=')
                 .ok_or_else(|| ApiError::BadRequest(format!("bad fieldSelector: {pair}")))?;
-            if k == "spec.nodeName" {
+            // `status.workerName` selects by bound worker; `spec.nodeName` is kept
+            // as a deprecated alias mapping to the same index column.
+            if k == "status.workerName" || k == "spec.nodeName" {
                 sel.node_name = Some(v.to_string());
             } else {
                 return Err(ApiError::BadRequest(format!(
@@ -171,6 +288,7 @@ async fn create(
     }
     let name =
         extract_name(&body).ok_or_else(|| ApiError::BadRequest("metadata.name required".into()))?;
+    validate_placement(kind, &body)?;
     let uid = Uuid::new_v4();
     let rv = state.store.next_resource_version()?;
     stamp_meta(&mut body, &uid, rv);
@@ -295,6 +413,7 @@ async fn replace(
     if !body.is_object() {
         return Err(ApiError::BadRequest("body must be a JSON object".into()));
     }
+    validate_placement(kind, &body)?;
     // Capture the client's optimistic-concurrency precondition before re-stamping.
     let precondition = body
         .get("metadata")
@@ -372,6 +491,8 @@ async fn replace_status(
         m.insert("resourceVersion".to_string(), serde_json::json!(rv));
     }
     existing.resource_version = rv;
+    // Status carries the bound worker; keep the index column in sync with it.
+    existing.node_name = extract_node_name(&existing.document);
     state.store.put(&existing)?;
     Ok(Json(existing.document))
 }
@@ -883,6 +1004,68 @@ mod tests {
         app(store)
     }
 
+    #[test]
+    fn rejects_unknown_affinity_operator() {
+        let doc = serde_json::json!({ "spec": { "affinity": { "required": [
+            { "matchExpressions": [ { "key": "z", "operator": "Nope", "values": [] } ] } ] } } });
+        assert!(validate_placement("Container", &doc).is_err());
+    }
+
+    #[test]
+    fn rejects_gt_with_non_integer_value() {
+        let doc = serde_json::json!({ "spec": { "affinity": { "required": [
+            { "matchExpressions": [ { "key": "z", "operator": "Gt", "values": ["abc"] } ] } ] } } });
+        assert!(validate_placement("Container", &doc).is_err());
+    }
+
+    #[test]
+    fn rejects_preferred_weight_out_of_range() {
+        let doc = serde_json::json!({ "spec": { "affinity": { "preferred": [
+            { "weight": 500, "preference": { "matchExpressions": [] } } ] } } });
+        assert!(validate_placement("Container", &doc).is_err());
+    }
+
+    #[test]
+    fn accepts_well_formed_placement() {
+        let doc = serde_json::json!({ "spec": { "affinity": { "required": [
+            { "matchExpressions": [ { "key": "z", "operator": "In", "values": ["us"] } ] } ],
+            "preferred": [ { "weight": 10, "preference": { "matchExpressions": [] } } ] },
+            "tolerations": [ { "key": "s", "operator": "Exists" } ] } });
+        assert!(validate_placement("Container", &doc).is_ok());
+    }
+
+    #[test]
+    fn index_column_tracks_bound_worker_not_desired_pin() {
+        // A user pins spec.nodeName=w9 but nothing is bound yet: column must be None.
+        let doc =
+            serde_json::json!({ "spec": { "nodeName": "w9" }, "status": { "phase": "Pending" } });
+        assert_eq!(extract_node_name(&doc), None);
+        // Once bound (status.workerName set), the column follows it.
+        let doc =
+            serde_json::json!({ "spec": { "nodeName": "w9" }, "status": { "workerName": "w3" } });
+        assert_eq!(extract_node_name(&doc).as_deref(), Some("w3"));
+    }
+
+    #[test]
+    fn field_selector_accepts_status_worker_name() {
+        let mut params = HashMap::new();
+        params.insert(
+            "fieldSelector".to_string(),
+            "status.workerName=w3".to_string(),
+        );
+        assert_eq!(
+            parse_selector(&params).ok().unwrap().node_name.as_deref(),
+            Some("w3")
+        );
+        // Legacy alias still works.
+        let mut params = HashMap::new();
+        params.insert("fieldSelector".to_string(), "spec.nodeName=w3".to_string());
+        assert_eq!(
+            parse_selector(&params).ok().unwrap().node_name.as_deref(),
+            Some("w3")
+        );
+    }
+
     async fn body_json(resp: axum::response::Response) -> serde_json::Value {
         let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
@@ -1000,7 +1183,8 @@ mod tests {
             "containers",
             serde_json::json!({
                 "metadata": { "name": "c1", "labels": { "team": "a" } },
-                "spec": { "image": "img", "nodeName": "node-7" }
+                "spec": { "image": "img" },
+                "status": { "workerName": "node-7" }
             }),
         )
         .await;
@@ -1009,7 +1193,8 @@ mod tests {
             "containers",
             serde_json::json!({
                 "metadata": { "name": "c2", "labels": { "team": "b" } },
-                "spec": { "image": "img", "nodeName": "node-8" }
+                "spec": { "image": "img" },
+                "status": { "workerName": "node-8" }
             }),
         )
         .await;
@@ -1051,7 +1236,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("GET")
-                    .uri("/api/v1/containers?fieldSelector=spec.nodeName=node-8")
+                    .uri("/api/v1/containers?fieldSelector=status.workerName=node-8")
                     .body(Body::empty())
                     .unwrap(),
             )

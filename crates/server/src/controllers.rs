@@ -10,7 +10,11 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use serde_json::Value;
-use velos_scheduler::{ResourceRequest, WorkerName, WorkerView, schedule};
+use velos_scheduler::{
+    NodeSelectorOperator, NodeSelectorRequirement, NodeSelectorTerm, Placement, PlacementRequest,
+    PreferredSchedulingTerm, ResourceRequest, Taint, TaintEffect, Toleration, TolerationOperator,
+    WorkerName, WorkerView, schedule,
+};
 use velos_store::{Selector, Store, StoreError, StoredObject};
 
 /// Default whole-core ask when a container omits `spec.resources.cpu`.
@@ -78,7 +82,7 @@ fn label(doc: &Value, key: &str) -> Option<String> {
 #[derive(Debug, Clone, PartialEq)]
 pub struct PendingContainer {
     pub name: String,
-    pub request: ResourceRequest,
+    pub request: PlacementRequest,
 }
 
 /// A decided placement of a container onto a worker.
@@ -86,6 +90,18 @@ pub struct PendingContainer {
 pub struct Binding {
     pub container: String,
     pub worker: String,
+}
+
+/// The outcome for one pending container in a scheduling pass.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PlacementOutcome {
+    Bind(Binding),
+    Unschedulable { container: String, reason: String },
+}
+
+/// The bound worker recorded in a container's status (the actual placement).
+fn worker_name(doc: &Value) -> Option<&str> {
+    str_at(doc, &["status", "workerName"])
 }
 
 fn container_request(doc: &Value) -> ResourceRequest {
@@ -97,14 +113,175 @@ fn container_request(doc: &Value) -> ResourceRequest {
     }
 }
 
-/// Containers that are `Pending` and not yet bound to a node.
+fn parse_node_selector(spec: &Value) -> Vec<(String, String)> {
+    spec.get("nodeSelector")
+        .and_then(Value::as_object)
+        .map(|m| {
+            m.iter()
+                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn parse_operator(s: &str) -> Option<NodeSelectorOperator> {
+    match s {
+        "In" => Some(NodeSelectorOperator::In),
+        "NotIn" => Some(NodeSelectorOperator::NotIn),
+        "Exists" => Some(NodeSelectorOperator::Exists),
+        "DoesNotExist" => Some(NodeSelectorOperator::DoesNotExist),
+        "Gt" => Some(NodeSelectorOperator::Gt),
+        "Lt" => Some(NodeSelectorOperator::Lt),
+        _ => None,
+    }
+}
+
+fn parse_requirement(v: &Value) -> Option<NodeSelectorRequirement> {
+    let key = v.get("key")?.as_str()?.to_string();
+    let operator = parse_operator(v.get("operator")?.as_str()?)?;
+    let values = v
+        .get("values")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    Some(NodeSelectorRequirement {
+        key,
+        operator,
+        values,
+    })
+}
+
+fn parse_term(v: &Value) -> NodeSelectorTerm {
+    let match_expressions = v
+        .get("matchExpressions")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(parse_requirement).collect())
+        .unwrap_or_default();
+    NodeSelectorTerm { match_expressions }
+}
+
+fn parse_affinity(spec: &Value) -> (Vec<NodeSelectorTerm>, Vec<PreferredSchedulingTerm>) {
+    let Some(na) = spec.get("affinity").filter(|v| v.is_object()) else {
+        return (Vec::new(), Vec::new());
+    };
+    let required = na
+        .get("required")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().map(parse_term).collect())
+        .unwrap_or_default();
+    let preferred = na
+        .get("preferred")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(|p| {
+                    let weight = p.get("weight")?.as_i64()? as i32;
+                    Some(PreferredSchedulingTerm {
+                        weight,
+                        preference: parse_term(p.get("preference")?),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    (required, preferred)
+}
+
+fn parse_taint_effect(s: &str) -> Option<TaintEffect> {
+    match s {
+        "NoSchedule" => Some(TaintEffect::NoSchedule),
+        "PreferNoSchedule" => Some(TaintEffect::PreferNoSchedule),
+        _ => None,
+    }
+}
+
+fn parse_toleration(v: &Value) -> Option<Toleration> {
+    let operator = match v.get("operator").and_then(Value::as_str) {
+        Some("Exists") => TolerationOperator::Exists,
+        Some("Equal") | None => TolerationOperator::Equal,
+        Some(_) => return None,
+    };
+    let effect = v
+        .get("effect")
+        .and_then(Value::as_str)
+        .and_then(parse_taint_effect);
+    Some(Toleration {
+        key: v
+            .get("key")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        operator,
+        value: v
+            .get("value")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        effect,
+    })
+}
+
+fn parse_tolerations(spec: &Value) -> Vec<Toleration> {
+    spec.get("tolerations")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(parse_toleration).collect())
+        .unwrap_or_default()
+}
+
+fn parse_taints(spec: &Value) -> Vec<Taint> {
+    spec.get("taints")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(|t| {
+                    let effect = parse_taint_effect(t.get("effect")?.as_str()?)?;
+                    Some(Taint {
+                        key: t.get("key")?.as_str()?.to_string(),
+                        value: t
+                            .get("value")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string(),
+                        effect,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Build the scheduler request for a container from its document.
+fn container_placement_request(doc: &Value) -> PlacementRequest {
+    let null = Value::Null;
+    let spec = doc.get("spec").unwrap_or(&null);
+    let (required, preferred) = parse_affinity(spec);
+    PlacementRequest {
+        resources: container_request(doc),
+        node_name: spec
+            .get("nodeName")
+            .and_then(Value::as_str)
+            .map(|s| WorkerName(s.to_string())),
+        node_selector: parse_node_selector(spec),
+        required,
+        preferred,
+        tolerations: parse_tolerations(spec),
+    }
+}
+
+/// Containers that are `Pending` and not yet bound to a worker. A container is
+/// bound once `status.workerName` is set; a user-supplied `spec.nodeName` is a
+/// *desired pin* (a request), not a binding, so it no longer excludes scheduling.
 fn pending_containers(containers: &[StoredObject]) -> Vec<PendingContainer> {
     containers
         .iter()
-        .filter(|c| phase(&c.document) == Some("Pending") && c.node_name.is_none())
+        .filter(|c| phase(&c.document) == Some("Pending") && worker_name(&c.document).is_none())
         .map(|c| PendingContainer {
             name: c.name.clone(),
-            request: container_request(&c.document),
+            request: container_placement_request(&c.document),
         })
         .collect()
 }
@@ -163,6 +340,8 @@ fn build_worker_views(workers: &[StoredObject], containers: &[StoredObject]) -> 
                         .unwrap_or(0),
                 },
                 allocated,
+                labels: w.labels.clone(),
+                taints: w.document.get("spec").map(parse_taints).unwrap_or_default(),
             }
         })
         .collect()
@@ -170,19 +349,30 @@ fn build_worker_views(workers: &[StoredObject], containers: &[StoredObject]) -> 
 
 /// Pure: greedily place each pending container, accounting for prior placements
 /// in the same pass so one worker is not overcommitted.
-pub fn plan_bindings(pending: &[PendingContainer], workers: &[WorkerView]) -> Vec<Binding> {
+pub fn plan_bindings(
+    pending: &[PendingContainer],
+    workers: &[WorkerView],
+) -> Vec<PlacementOutcome> {
     let mut views = workers.to_vec();
     let mut out = Vec::new();
     for p in pending {
-        if let Some(WorkerName(name)) = schedule(&p.request, &views) {
-            if let Some(w) = views.iter_mut().find(|w| w.name.0 == name) {
-                w.allocated.cpu += p.request.cpu;
-                w.allocated.memory_bytes += p.request.memory_bytes;
+        match schedule(&p.request, &views) {
+            Placement::Scheduled(WorkerName(name)) => {
+                if let Some(w) = views.iter_mut().find(|w| w.name.0 == name) {
+                    w.allocated.cpu += p.request.resources.cpu;
+                    w.allocated.memory_bytes += p.request.resources.memory_bytes;
+                }
+                out.push(PlacementOutcome::Bind(Binding {
+                    container: p.name.clone(),
+                    worker: name,
+                }));
             }
-            out.push(Binding {
-                container: p.name.clone(),
-                worker: name,
-            });
+            Placement::Unschedulable { reason } => {
+                out.push(PlacementOutcome::Unschedulable {
+                    container: p.name.clone(),
+                    reason,
+                });
+            }
         }
     }
     out
@@ -194,30 +384,54 @@ pub fn reconcile_scheduling(store: &dyn Store) -> Result<usize, StoreError> {
     let workers = store.list("Worker", &Selector::default())?;
     let pending = pending_containers(&containers);
     let views = build_worker_views(&workers, &containers);
-    let bindings = plan_bindings(&pending, &views);
+    let outcomes = plan_bindings(&pending, &views);
 
     let mut n = 0;
-    for b in &bindings {
-        let Some(mut obj) = store.get("Container", &b.container)? else {
-            continue;
-        };
-        let rv = store.next_resource_version()?;
-        if let Some(spec) = obj.document.get_mut("spec").and_then(Value::as_object_mut) {
-            spec.insert("nodeName".to_string(), serde_json::json!(b.worker));
+    for outcome in &outcomes {
+        match outcome {
+            PlacementOutcome::Bind(b) => {
+                let Some(mut obj) = store.get("Container", &b.container)? else {
+                    continue;
+                };
+                let rv = store.next_resource_version()?;
+                // `spec.nodeName` is user-owned (the desired pin); the binding is
+                // recorded only in status + the bound-worker index column.
+                set_phase(&mut obj.document, "Scheduled");
+                if let Some(status) = obj
+                    .document
+                    .get_mut("status")
+                    .and_then(Value::as_object_mut)
+                {
+                    status.insert("workerName".to_string(), serde_json::json!(b.worker));
+                }
+                set_rv(&mut obj.document, rv);
+                obj.resource_version = rv;
+                obj.node_name = Some(b.worker.clone());
+                store.put(&obj)?;
+                n += 1;
+            }
+            PlacementOutcome::Unschedulable { container, reason } => {
+                let Some(mut obj) = store.get("Container", container)? else {
+                    continue;
+                };
+                // Record why it can't be placed — but only on change, to avoid
+                // rewriting (and bumping the resource version) every tick.
+                if str_at(&obj.document, &["status", "message"]) == Some(reason.as_str()) {
+                    continue;
+                }
+                let rv = store.next_resource_version()?;
+                if let Some(status) = obj
+                    .document
+                    .get_mut("status")
+                    .and_then(Value::as_object_mut)
+                {
+                    status.insert("message".to_string(), serde_json::json!(reason));
+                }
+                set_rv(&mut obj.document, rv);
+                obj.resource_version = rv;
+                store.put(&obj)?;
+            }
         }
-        set_phase(&mut obj.document, "Scheduled");
-        if let Some(status) = obj
-            .document
-            .get_mut("status")
-            .and_then(Value::as_object_mut)
-        {
-            status.insert("workerName".to_string(), serde_json::json!(b.worker));
-        }
-        set_rv(&mut obj.document, rv);
-        obj.resource_version = rv;
-        obj.node_name = Some(b.worker.clone());
-        store.put(&obj)?;
-        n += 1;
     }
     Ok(n)
 }
@@ -364,8 +578,14 @@ pub fn reconcile_node_lifecycle(
             let rv = store.next_resource_version()?;
             let mut obj = c.clone();
             if reschedulable {
-                if let Some(spec) = obj.document.get_mut("spec").and_then(Value::as_object_mut) {
-                    spec.remove("nodeName");
+                // Clear the binding (status + index column) so the scheduler
+                // re-places it; the user's `spec.nodeName` pin is preserved.
+                if let Some(status) = obj
+                    .document
+                    .get_mut("status")
+                    .and_then(Value::as_object_mut)
+                {
+                    status.remove("workerName");
                 }
                 obj.node_name = None;
                 set_phase(&mut obj.document, "Pending");
@@ -432,14 +652,134 @@ mod tests {
                 cpu: 0,
                 memory_bytes: 0,
             },
+            labels: std::collections::HashMap::new(),
+            taints: Vec::new(),
         }
     }
 
-    fn req(cpu: u32, mem: u64) -> ResourceRequest {
-        ResourceRequest {
-            cpu,
-            memory_bytes: mem,
+    fn req(cpu: u32, mem: u64) -> PlacementRequest {
+        PlacementRequest {
+            resources: ResourceRequest {
+                cpu,
+                memory_bytes: mem,
+            },
+            node_name: None,
+            node_selector: Vec::new(),
+            required: Vec::new(),
+            preferred: Vec::new(),
+            tolerations: Vec::new(),
         }
+    }
+
+    fn worker_obj(name: &str, labels: &[(&str, &str)], taints: Value) -> StoredObject {
+        let lbls: std::collections::HashMap<String, String> = labels
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        StoredObject {
+            kind: "Worker".to_string(),
+            name: name.to_string(),
+            uid: uuid::Uuid::new_v4(),
+            resource_version: 0,
+            node_name: None,
+            labels: lbls.clone(),
+            document: serde_json::json!({
+                "metadata": { "name": name, "labels": lbls },
+                "spec": { "unschedulable": false, "taints": taints },
+                "status": {
+                    "allocatable": { "cpu": 8, "memoryBytes": 16u64 * GB },
+                    "conditions": [{ "conditionType": "Ready", "status": true }],
+                }
+            }),
+        }
+    }
+
+    fn container_obj(name: &str, phase: &str, worker: Option<&str>) -> StoredObject {
+        let mut status = serde_json::json!({ "phase": phase });
+        if let Some(w) = worker {
+            status["workerName"] = serde_json::json!(w);
+        }
+        StoredObject {
+            kind: "Container".to_string(),
+            name: name.to_string(),
+            uid: uuid::Uuid::new_v4(),
+            resource_version: 0,
+            // The index column mirrors the bound worker (status.workerName).
+            node_name: worker.map(str::to_string),
+            labels: std::collections::HashMap::new(),
+            document: serde_json::json!({
+                "metadata": { "name": name },
+                "spec": { "image": "img", "resources": { "cpu": 1, "memoryBytes": 1024 } },
+                "status": status,
+            }),
+        }
+    }
+
+    #[test]
+    fn schedules_container_with_user_set_node_name() {
+        // A Pending container that already carries spec.nodeName must still be
+        // scheduled (it is a request, not a binding) while status.workerName is absent.
+        let mut c = container_obj("c1", "Pending", None);
+        c.document["spec"]["nodeName"] = serde_json::json!("w1");
+        let workers = [worker_obj("w1", &[], serde_json::json!([]))];
+        let pending = pending_containers(std::slice::from_ref(&c));
+        assert_eq!(
+            pending.len(),
+            1,
+            "user-pinned Pending container must be schedulable"
+        );
+        let views = build_worker_views(&workers, &[]);
+        let out = plan_bindings(&pending, &views);
+        assert!(matches!(out.as_slice(),
+            [PlacementOutcome::Bind(b)] if b.worker == "w1"));
+    }
+
+    #[test]
+    fn already_bound_container_is_not_pending() {
+        // status.workerName present -> not a scheduling candidate.
+        let c = container_obj("c1", "Scheduled", Some("w1"));
+        assert!(pending_containers(std::slice::from_ref(&c)).is_empty());
+    }
+
+    #[test]
+    fn parses_placement_from_spec() {
+        let doc = serde_json::json!({
+            "spec": {
+                "resources": { "cpu": 2, "memoryBytes": 1024 },
+                "nodeName": "w2",
+                "nodeSelector": { "gpu": "true" },
+                "affinity": {
+                    "required": [ { "matchExpressions": [
+                        { "key": "zone", "operator": "In", "values": ["us"] } ] } ],
+                    "preferred": [ { "weight": 10, "preference": { "matchExpressions": [
+                        { "key": "fast", "operator": "Exists", "values": [] } ] } } ]
+                },
+                "tolerations": [ { "key": "spot", "operator": "Exists" } ]
+            }
+        });
+        let p = container_placement_request(&doc);
+        assert_eq!(p.node_name, Some(WorkerName("w2".into())));
+        assert_eq!(
+            p.node_selector,
+            vec![("gpu".to_string(), "true".to_string())]
+        );
+        assert_eq!(p.required.len(), 1);
+        assert_eq!(p.preferred.len(), 1);
+        assert_eq!(p.preferred[0].weight, 10);
+        assert_eq!(p.tolerations.len(), 1);
+    }
+
+    #[test]
+    fn parses_worker_labels_and_taints() {
+        let workers = [worker_obj(
+            "w1",
+            &[("gpu", "true")],
+            serde_json::json!([{ "key": "spot", "value": "", "effect": "NoSchedule" }]),
+        )];
+        let views = build_worker_views(&workers, &[]);
+        assert_eq!(views[0].labels.get("gpu").map(String::as_str), Some("true"));
+        assert_eq!(views[0].taints.len(), 1);
+        assert_eq!(views[0].taints[0].effect, TaintEffect::NoSchedule);
     }
 
     #[test]
@@ -460,10 +800,15 @@ mod tests {
         ];
         // One worker with 4 cores fits exactly two 2-core containers.
         let workers = vec![view("w1", 4, 8 * GB)];
-        let bindings = plan_bindings(&pending, &workers);
-        assert_eq!(bindings.len(), 2);
-        assert_eq!(bindings[0].worker, "w1");
-        assert_eq!(bindings[1].worker, "w1");
+        let outcomes = plan_bindings(&pending, &workers);
+        let bound: Vec<&str> = outcomes
+            .iter()
+            .filter_map(|o| match o {
+                PlacementOutcome::Bind(b) => Some(b.worker.as_str()),
+                PlacementOutcome::Unschedulable { .. } => None,
+            })
+            .collect();
+        assert_eq!(bound, vec!["w1", "w1"]);
     }
 
     #[test]
@@ -542,7 +887,7 @@ mod tests {
         let c = store.get("Container", "c1").unwrap().unwrap();
         assert_eq!(c.node_name.as_deref(), Some("w1"));
         assert_eq!(phase(&c.document), Some("Scheduled"));
-        assert_eq!(c.document["spec"]["nodeName"], "w1");
+        assert_eq!(c.document["status"]["workerName"], "w1");
     }
 
     #[test]
