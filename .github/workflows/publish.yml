@@ -33,7 +33,7 @@ jobs:
 
       # The web UI is not committed; build it just-in-time so `include` bakes it
       # into the published velos-server crate.
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
           node-version: "20"
       - name: Build web UI
@@ -107,7 +107,7 @@ jobs:
           targets: ${{ matrix.target }}
 
       # Build the (uncommitted) web UI so it is embedded into velos-server.
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
           node-version: "20"
       - name: Build web UI
