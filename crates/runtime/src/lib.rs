@@ -309,6 +309,23 @@ fn field_str<'a>(entry: &'a serde_json::Value, keys: &[&str]) -> Option<&'a str>
     None
 }
 
+/// Read the instance state string. The real Apple `container` CLI nests it as
+/// `status.state` (an object, not a flat string), so `field_str` alone misses
+/// it; fall back to that shape when the flat lookup comes up empty.
+fn status_str(entry: &serde_json::Value) -> &str {
+    if let Some(s) = field_str(entry, &["status", "state"]) {
+        return s;
+    }
+    if let Some(s) = entry
+        .get("status")
+        .and_then(|v| v.get("state"))
+        .and_then(|v| v.as_str())
+    {
+        return s;
+    }
+    "unknown"
+}
+
 /// Parse `container list --format json` into our uid-keyed instances. Entries
 /// whose name lacks the `velos-` prefix are ignored (not ours). Field names are
 /// matched tolerantly to survive minor CLI schema differences.
@@ -327,7 +344,7 @@ fn parse_list(raw: &str) -> Result<Vec<Instance>, RuntimeError> {
         let Some(uid) = name.strip_prefix(NAME_PREFIX) else {
             continue;
         };
-        let status = field_str(&entry, &["status", "state"]).unwrap_or("unknown");
+        let status = status_str(&entry);
         let running = status.eq_ignore_ascii_case("running");
         let state = if running {
             InstanceState::Running
@@ -469,5 +486,31 @@ mod tests {
         assert_eq!(got[0].state, InstanceState::Running);
         assert_eq!(got[1].uid, "u2");
         assert_eq!(got[1].state, InstanceState::Exited { exit_code: 2 });
+    }
+
+    #[test]
+    fn parse_list_reads_running_state_from_real_apple_container_shape() {
+        // Actual `container list --all --format json` output (Apple `container`
+        // CLI 1.0.0) nests the state under `status.state` rather than exposing a
+        // flat `status`/`state` string — see issue where running containers were
+        // reported as Succeeded.
+        let raw = r#"[
+            {"id":"velos-u1","status":{"state":"running","startedDate":"2026-07-18T17:45:28Z"}}
+        ]"#;
+        let got = parse_list(raw).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].uid, "u1");
+        assert_eq!(got[0].state, InstanceState::Running);
+    }
+
+    #[test]
+    fn parse_list_reads_stopped_state_from_real_apple_container_shape() {
+        let raw = r#"[
+            {"id":"velos-u1","status":{"state":"stopped","startedDate":"2026-07-18T17:45:28Z"}}
+        ]"#;
+        let got = parse_list(raw).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].uid, "u1");
+        assert_eq!(got[0].state, InstanceState::Exited { exit_code: 0 });
     }
 }
