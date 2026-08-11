@@ -1294,18 +1294,18 @@ dependencies = [
 
 [[package]]
 name = "fluorite"
-version = "0.6.1"
+version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c55fd87179537815902609ade7d21185ed0cb0eb2894dbe04e6457070682225d"
+checksum = "0fa1a708aa357ab6988d028a36fcd254f16eed5a79e3363b49a2999fdce7c8bc"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "fluorite_codegen"
-version = "0.6.1"
+version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b59d6da25eebd5cc3e341c366df213967f32a9ab00d94b0cc753b50b9e752a14"
+checksum = "ba8c71a72f55aab3c3bfdf09eaf448af91ce075d9f707f386cc5c307ec5add95"
 dependencies = [
  "anyhow",
  "ariadne",
