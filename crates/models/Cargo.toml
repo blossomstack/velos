@@ -17,5 +17,5 @@ uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 
 [build-dependencies]
-fluorite_codegen = "0.7.0"
+fluorite_codegen = "0.9.0"
 anyhow = "1.0"
