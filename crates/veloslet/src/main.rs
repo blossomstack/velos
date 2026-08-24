@@ -56,6 +56,9 @@ enum Command {
     /// Remove the background worker for good: LaunchAgent, app bundle, and the
     /// config with its credential.
     Uninstall(PathArgs),
+    /// Check this worker's setup and the control plane, and report what to fix.
+    /// Exits non-zero if anything is broken.
+    Doctor(PathArgs),
 }
 
 #[derive(Subcommand, Debug)]
@@ -345,6 +348,22 @@ async fn run(path: PathBuf) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
+// doctor
+// ---------------------------------------------------------------------------
+
+async fn doctor(config_path: PathBuf) -> Result<()> {
+    let report = veloslet::doctor::diagnose(config_path).await;
+    println!("veloslet doctor\n");
+    print!("{report}");
+    if report.has_failures() {
+        // A non-zero exit lets a script gate on a healthy worker; the report
+        // above already said what is wrong.
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // run -d / stop / uninstall (side effects)
 // ---------------------------------------------------------------------------
 
@@ -549,6 +568,7 @@ async fn main() -> Result<()> {
                 run(path).await
             }
         }
+        Command::Doctor(path) => doctor(path.resolve()?).await,
         Command::Stop(path) => stop(path.resolve()?),
         Command::Uninstall(path) => uninstall(path.resolve()?),
     }

@@ -274,6 +274,42 @@ looking at the terminal rather than at the next restart.
 
 Restart the worker for a change to take effect.
 
+### Check a worker with `veloslet doctor`
+
+```bash
+veloslet doctor
+```
+
+The worker-side counterpart of `velosctl doctor`. It reports the `veloslet`
+version and path; the config file and its permissions; whether this worker has
+joined; the server URL and whether it answers; whether the server still accepts
+this worker's credential **and agrees on its name**; advertised capacity against
+what the machine physically has; the `container` runtime; and whether launchd is
+running the background worker. Every line that isn't a pass carries the command
+that fixes it.
+
+```
+  ✔ veloslet     v0.2.0 (/Users/you/.local/bin/veloslet)
+  ✔ config file  /Users/you/.velos/veloslet.json
+  ✔ joined       holds a credential for macmini-2
+  ✔ server       http://127.0.0.1:8080
+  ✔ reachable    http://127.0.0.1:8080 answered /healthz
+  ✔ identity     the server knows this worker as macmini-2
+  ✔ capacity     advertising 8 cpu, 16G of 10 cpu, 32G
+  ✔ runtime      container CLI version 1.0.0
+  ! background   no LaunchAgent loaded — this worker only runs while `veloslet run` is in a terminal
+                   → run `veloslet run -d` to keep it running across logins and crashes
+
+1 warning, nothing broken
+```
+
+Like `velosctl doctor` it only reads, a `-` means the check was skipped because
+an earlier one made it meaningless, and it exits non-zero when something failed
+(warnings alone still exit 0). Two failures it is specifically built to name,
+because both otherwise surface as an unexplained `401` in the worker's log: a
+credential the server has revoked (the worker was deleted), and a config whose
+`node` was edited after joining, so the credential belongs to a different name.
+
 ### Run as a background daemon
 
 `veloslet run -d` runs the same worker as a long-running service (a launchd
@@ -458,7 +494,7 @@ Auth endpoints at a glance:
 
 ## 10. Troubleshooting
 
-Start with **`velosctl doctor`** (§4) — it names the broken layer and the command
+Start with **`velosctl doctor`** (§4), or **`veloslet doctor`** on a worker machine — it names the broken layer and the command
 that fixes it. The table below covers the rest.
 
 | Symptom | Likely cause / fix |
