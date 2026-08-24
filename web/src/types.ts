@@ -51,6 +51,10 @@ export interface ContainerStatus {
   hibernatedAt?: string;
   finishedAt?: string;
   exitCode?: number;
+  /// Why the container is not in the phase the user asked for — e.g.
+  /// `StartFailed` when the worker could not launch it. Set alongside
+  /// `message`, and cleared by the next status the worker publishes.
+  reason?: string;
   message?: string;
 }
 

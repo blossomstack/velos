@@ -126,6 +126,50 @@ pub enum Action {
     Reap { uid: String },
 }
 
+impl Action {
+    /// The container this action converges, if it names one. Only [`Reap`] does
+    /// not: it acts on an orphaned instance the server has no object for.
+    ///
+    /// [`Reap`]: Action::Reap
+    pub fn container(&self) -> Option<&str> {
+        match self {
+            Action::Start { name, .. }
+            | Action::Restart { name, .. }
+            | Action::ReportRunning { name }
+            | Action::ReportTerminal { name, .. }
+            | Action::Hibernate { name, .. }
+            | Action::Resume { name, .. }
+            | Action::ReportHibernated { name }
+            | Action::Cleanup { name, .. }
+            | Action::ClearFinalizer { name } => Some(name),
+            Action::Reap { .. } => None,
+        }
+    }
+
+    /// The `status.reason` to publish when this action fails, or `None` when a
+    /// failure is not the container's to carry.
+    ///
+    /// Only the actions that drive the runtime toward the user's desired state
+    /// get one. The `Report*` actions are excluded because their only failure
+    /// mode is the control plane being unreachable — the very thing a status
+    /// write would need — and the teardown actions because the object they
+    /// would annotate is on its way out.
+    pub fn failure_reason(&self) -> Option<&'static str> {
+        match self {
+            Action::Start { .. } => Some("StartFailed"),
+            Action::Restart { .. } => Some("RestartFailed"),
+            Action::Resume { .. } => Some("ResumeFailed"),
+            Action::Hibernate { .. } => Some("HibernateFailed"),
+            Action::ReportRunning { .. }
+            | Action::ReportTerminal { .. }
+            | Action::ReportHibernated { .. }
+            | Action::Cleanup { .. }
+            | Action::ClearFinalizer { .. }
+            | Action::Reap { .. } => None,
+        }
+    }
+}
+
 /// `ContainerPhase::Hibernated` on the wire.
 const HIBERNATED: &str = "Hibernated";
 

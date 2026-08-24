@@ -99,9 +99,23 @@ export function Containers() {
                   </td>
                   <td className="px-5 py-3">
                     <PhaseBadge phase={phaseOf(c)} />
+                    {/* A container the worker cannot launch keeps its phase —
+                        it really is still Scheduled — so the phase alone reads
+                        as "any moment now" for something that will never
+                        happen. The reason is the answer to "why is this stuck". */}
+                    {c.status?.reason && (
+                      <div
+                        className="mt-1.5 truncate text-xs text-amber-400/90"
+                        title={c.status.message ?? c.status.reason}
+                      >
+                        {c.status.reason}
+                      </div>
+                    )}
                   </td>
                   <td className="px-5 py-3 font-mono text-xs text-zinc-400">{c.spec.image}</td>
-                  <td className="px-5 py-3 text-zinc-400">{c.spec.nodeName ?? <span className="text-zinc-600">unscheduled</span>}</td>
+                  <td className="px-5 py-3 text-zinc-400">
+                    <NodeCell container={c} />
+                  </td>
                   <td className="px-5 py-3 text-zinc-400">
                     {c.spec.resources?.cpu ?? 1} cpu · {fmtBytes(c.spec.resources?.memoryBytes)}
                   </td>
@@ -156,6 +170,26 @@ export function Containers() {
   );
 }
 
+/// Which worker a container is on.
+///
+/// The binding lives in `status.workerName` — `spec.nodeName` is the *pin the
+/// user asked for*, a request the scheduler weighs and may not honour. Reading
+/// only the spec meant every scheduled container read "unscheduled" unless it
+/// happened to be pinned, which hid the one thing you need when a container is
+/// not running: which worker to go and look at.
+function NodeCell({ container }: { container: Container }) {
+  const bound = container.status?.workerName;
+  if (bound) return <>{bound}</>;
+  if (container.spec.nodeName) {
+    return (
+      <span className="text-zinc-500">
+        {container.spec.nodeName} <span className="text-zinc-600">(requested)</span>
+      </span>
+    );
+  }
+  return <span className="text-zinc-600">unscheduled</span>;
+}
+
 function ContainerDrawer({ container, onClose }: { container: Container | null; onClose: () => void }) {
   if (!container) return <Drawer open={false} onClose={onClose} title="" children={null} />;
   const s = container.status ?? {};
@@ -173,7 +207,9 @@ function ContainerDrawer({ container, onClose }: { container: Container | null; 
         <Field label="Command">
           <span className="font-mono text-xs">{container.spec.command?.join(" ") || "—"}</span>
         </Field>
-        <Field label="Node">{container.spec.nodeName ?? "unscheduled"}</Field>
+        <Field label="Node">
+          <NodeCell container={container} />
+        </Field>
         <Field label="Restart policy">{container.spec.restartPolicy ?? "Never"}</Field>
         <Field label="Desired state">{container.spec.desiredState ?? "Running"}</Field>
         <Field label="Resources">
@@ -186,7 +222,16 @@ function ContainerDrawer({ container, onClose }: { container: Container | null; 
         <Field label="Hibernated">{s.hibernatedAt ? `${ageFrom(s.hibernatedAt)} ago` : "—"}</Field>
         <Field label="Finished">{s.finishedAt ? `${ageFrom(s.finishedAt)} ago` : "—"}</Field>
         <Field label="Exit code">{s.exitCode ?? "—"}</Field>
-        {s.message && <Field label="Message">{s.message}</Field>}
+        {s.reason && (
+          <Field label="Reason">
+            <span className="text-amber-400/90">{s.reason}</span>
+          </Field>
+        )}
+        {s.message && (
+          <Field label="Message">
+            <span className="font-mono text-xs break-all">{s.message}</span>
+          </Field>
+        )}
         <Field label="Created">{ageFrom(container.metadata.creationTimestamp)} ago</Field>
       </div>
 
