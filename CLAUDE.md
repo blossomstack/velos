@@ -106,4 +106,5 @@ Pre-PR gate — `make check`:
 cargo fmt --all --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --workspace
+sh scripts/test-install.sh   # install.sh against a fake release over localhost
 ```
