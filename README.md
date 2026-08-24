@@ -36,7 +36,7 @@ direction.
   prove liveness, and reconciles its assigned containers against the runtime.
 - **`velosctl`** — a command-line client for the API. `velosctl login` saves an
   admin token (and server URL) to `~/.velos/config` for subsequent calls, and
-  `velosctl doctor` diagnoses a setup that isn't working.
+  `velosctl doctor` and `veloslet doctor` diagnose a setup that isn't working.
 - **Web dashboard** — a React UI for first-run admin setup, watching workers and
   containers, launching workloads, and managing CLI tokens, served directly by the
   server.
@@ -122,7 +122,9 @@ Or build from source with `make build` (which also builds the embedded dashboard
 At any point, **`velosctl doctor`** checks your setup — config file, server URL,
 credential, whether the control plane is reachable and initialized, how many
 workers are Ready, and whether this machine has a container runtime — and prints
-what to fix.
+what to fix. On a worker machine, **`veloslet doctor`** does the same for the
+worker: whether it has joined, whether its credential is still accepted, whether
+its advertised capacity fits the host, and whether the background agent is running.
 
 Then follow **[docs/getting-started.md](docs/getting-started.md)** for the full
 walkthrough: start the control plane, set up the admin account and connect
