@@ -117,6 +117,7 @@ pub fn plural_for(kind: &str) -> Option<&'static str> {
         "container" | "containers" => Some("containers"),
         "worker" | "workers" => Some("workers"),
         "lease" | "leases" => Some("leases"),
+        "service" | "services" => Some("services"),
         _ => None,
     }
 }
@@ -150,6 +151,7 @@ mod tests {
     fn plural_normalizes_singular_and_plural() {
         assert_eq!(plural_for("container"), Some("containers"));
         assert_eq!(plural_for("workers"), Some("workers"));
+        assert_eq!(plural_for("service"), Some("services"));
         assert_eq!(plural_for("lease"), Some("leases"));
         assert_eq!(plural_for("widget"), None);
     }

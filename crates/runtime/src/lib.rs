@@ -53,6 +53,12 @@ pub struct Instance {
     pub uid: String,
     pub id: InstanceId,
     pub state: InstanceState,
+    /// The instance's address on the worker's container network, when the
+    /// runtime reports one. `None` for anything not currently running, and for
+    /// a runtime that does not give instances their own address — so a caller
+    /// that needs to dial the instance must handle its absence rather than
+    /// assume a default. This is what the worker-side service proxy forwards to.
+    pub ip: Option<String>,
 }
 
 #[async_trait]
@@ -83,15 +89,35 @@ pub trait ContainerRuntime: Send + Sync {
 
 /// An in-memory runtime used by tests and `velos-tests`. Exit can be simulated
 /// with [`FakeRuntime::set_exited`].
-#[derive(Default)]
 pub struct FakeRuntime {
     instances: Mutex<HashMap<String, Instance>>,
     runs: Mutex<usize>,
+    instance_ip: String,
+}
+
+impl Default for FakeRuntime {
+    fn default() -> Self {
+        Self {
+            instances: Mutex::new(HashMap::new()),
+            runs: Mutex::new(0),
+            // Loopback, so a test can put a real listener behind a fake
+            // instance and drive traffic through the worker's service proxy.
+            instance_ip: "127.0.0.1".to_string(),
+        }
+    }
 }
 
 impl FakeRuntime {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Use `ip` as the address of every instance this runtime launches.
+    pub fn with_instance_ip(ip: impl Into<String>) -> Self {
+        Self {
+            instance_ip: ip.into(),
+            ..Self::default()
+        }
     }
 
     /// How many times [`run`](ContainerRuntime::run) launched a *fresh*
@@ -123,6 +149,7 @@ impl ContainerRuntime for FakeRuntime {
                 uid: spec.uid.clone(),
                 id: id.clone(),
                 state: InstanceState::Running,
+                ip: Some(self.instance_ip.clone()),
             },
         );
         Ok(id)
@@ -155,7 +182,18 @@ impl ContainerRuntime for FakeRuntime {
 
     async fn list(&self) -> Result<Vec<Instance>, RuntimeError> {
         let g = self.instances.lock().map_err(|_| RuntimeError::Lock)?;
-        Ok(g.values().cloned().collect())
+        Ok(g.values()
+            .cloned()
+            .map(|mut i| {
+                // Mirror the real backend: an address belongs to a *running*
+                // instance. Derived here rather than cleared at each transition,
+                // so no future state change can forget to do it.
+                if i.state != InstanceState::Running {
+                    i.ip = None;
+                }
+                i
+            })
+            .collect())
     }
 
     async fn version(&self) -> Result<String, RuntimeError> {
@@ -367,6 +405,19 @@ fn status_str(entry: &serde_json::Value) -> &str {
     "unknown"
 }
 
+/// Read the instance's container-network IPv4 address. apple/container reports
+/// it as `status.networks[].ipv4Address` in CIDR form (`192.168.64.68/24`), so
+/// the prefix length is trimmed off. Absent for a stopped instance.
+fn address_str(entry: &serde_json::Value) -> Option<String> {
+    let addr = entry
+        .get("status")?
+        .get("networks")?
+        .as_array()?
+        .iter()
+        .find_map(|n| n.get("ipv4Address").and_then(|v| v.as_str()))?;
+    Some(addr.split('/').next().unwrap_or(addr).to_string())
+}
+
 /// Parse `container list --format json` into our uid-keyed instances. Entries
 /// whose name lacks the `velos-` prefix are ignored (not ours). Field names are
 /// matched tolerantly to survive minor CLI schema differences.
@@ -400,10 +451,15 @@ fn parse_list(raw: &str) -> Result<Vec<Instance>, RuntimeError> {
                 .unwrap_or(0) as i32;
             InstanceState::Exited { exit_code }
         };
+        // Only a running instance has a usable address: apple/container keeps
+        // the last-known `networks` entry on a stopped one, and forwarding to it
+        // would hand traffic to whatever picks the address up next.
+        let ip = if running { address_str(&entry) } else { None };
         out.push(Instance {
             uid: uid.to_string(),
             id: InstanceId(name.to_string()),
             state,
+            ip,
         });
     }
     Ok(out)
@@ -483,6 +539,29 @@ mod tests {
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].uid, "u1");
         assert_eq!(got[0].state, InstanceState::Exited { exit_code: 0 });
+    }
+
+    #[test]
+    fn parse_list_reads_the_container_network_address() {
+        // Shape captured from a live `container list --all --format json` on
+        // apple/container 1.0.0: the address is nested under status.networks and
+        // carries a prefix length, which must not reach a `connect()`.
+        let raw = r#"[
+            {"id":"velos-u1","status":{"state":"running","networks":[
+                {"hostname":"velos-u1","ipv4Address":"192.168.64.68/24","ipv4Gateway":"192.168.64.1"}
+            ]}},
+            {"id":"velos-u2","status":{"state":"stopped","networks":[
+                {"hostname":"velos-u2","ipv4Address":"192.168.64.66/24"}
+            ]}}
+        ]"#;
+        let got = parse_list(raw).unwrap();
+        assert_eq!(got[0].ip.as_deref(), Some("192.168.64.68"));
+        assert_eq!(
+            got[1].ip, None,
+            "a stopped instance keeps its last address in the CLI output, but \
+             nothing is listening on it — reporting it would send traffic to \
+             whichever instance takes the address next"
+        );
     }
 
     #[test]

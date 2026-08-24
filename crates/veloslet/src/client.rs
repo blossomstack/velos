@@ -75,6 +75,19 @@ impl ApiClient {
             .unwrap_or_default())
     }
 
+    /// Every Service in the cluster. The worker filters them against its own
+    /// containers locally: a Service names containers by label, and only the
+    /// worker knows which of them have a live instance here.
+    pub async fn list_services(&self) -> Result<Vec<Value>, ClientError> {
+        let url = format!("{}/api/v1/services", self.base);
+        let body = self.send(self.http.get(url)).await?;
+        Ok(body
+            .get("items")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default())
+    }
+
     pub async fn get_container(&self, name: &str) -> Result<Option<Value>, ClientError> {
         let url = format!("{}/api/v1/containers/{name}", self.base);
         match self.send(self.http.get(url)).await {

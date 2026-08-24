@@ -1,23 +1,25 @@
 import { useEffect, useState } from "react";
-import { Box, KeyRound, LayoutDashboard, LogOut, Server } from "lucide-react";
-import { useContainers, useWorkers } from "./api";
+import { Box, KeyRound, LayoutDashboard, LogOut, Network, Server } from "lucide-react";
+import { useContainers, useServices, useWorkers } from "./api";
 import { logout } from "./auth";
 import { isWorkerReady } from "./format";
 import { Overview } from "./views/Overview";
 import { Workers } from "./views/Workers";
 import { Containers } from "./views/Containers";
+import { Services } from "./views/Services";
 import { Tokens } from "./views/Tokens";
 
-type Tab = "overview" | "workers" | "containers" | "tokens";
+type Tab = "overview" | "workers" | "containers" | "services" | "tokens";
 
 const NAV: { id: Tab; label: string; icon: React.ReactNode }[] = [
   { id: "overview", label: "Overview", icon: <LayoutDashboard size={18} /> },
   { id: "workers", label: "Workers", icon: <Server size={18} /> },
   { id: "containers", label: "Containers", icon: <Box size={18} /> },
+  { id: "services", label: "Services", icon: <Network size={18} /> },
   { id: "tokens", label: "Tokens", icon: <KeyRound size={18} /> },
 ];
 
-const TABS: Tab[] = ["overview", "workers", "containers", "tokens"];
+const TABS: Tab[] = ["overview", "workers", "containers", "services", "tokens"];
 
 function tabFromHash(): Tab {
   const h = window.location.hash.replace("#", "") as Tab;
@@ -39,6 +41,7 @@ export default function App() {
 
   const { data: workers = [], isError } = useWorkers();
   const { data: containers = [] } = useContainers();
+  const { data: services = [] } = useServices();
 
   // A heartbeat dot that ticks every refetch so "live" feels alive.
   const [beat, setBeat] = useState(false);
@@ -86,6 +89,11 @@ export default function App() {
                   {containers.length}
                 </span>
               )}
+              {n.id === "services" && services.length > 0 && (
+                <span className="ml-auto rounded-full bg-white/5 px-2 py-0.5 text-[11px] text-zinc-400">
+                  {services.length}
+                </span>
+              )}
             </button>
           ))}
         </nav>
@@ -109,6 +117,7 @@ export default function App() {
               {tab === "overview" && "Cluster health and capacity at a glance"}
               {tab === "workers" && "Registered nodes and their leases"}
               {tab === "containers" && "Workloads across the cluster"}
+              {tab === "services" && "Stable ports in front of the containers they select"}
               {tab === "tokens" && "CLI access tokens for velosctl"}
             </p>
           </div>
@@ -132,6 +141,7 @@ export default function App() {
           {tab === "overview" && <Overview />}
           {tab === "workers" && <Workers />}
           {tab === "containers" && <Containers />}
+          {tab === "services" && <Services />}
           {tab === "tokens" && <Tokens />}
         </div>
       </main>

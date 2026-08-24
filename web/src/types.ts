@@ -105,6 +105,41 @@ export interface Lease {
   spec: LeaseSpec;
 }
 
+/// One port a Service exposes. Velos has no cluster IP — each worker's
+/// container network is its own island — so there is no equivalent of the
+/// Kubernetes `port` field: `nodePort` is bound on the workers, and forwarded
+/// to `targetPort` inside the container. The server assigns `nodePort` at
+/// admission, so a served Service always has one.
+export interface ServicePort {
+  name?: string;
+  targetPort: number;
+  nodePort: number;
+}
+
+export interface ServiceSpec {
+  selector: Record<string, string>;
+  ports: ServicePort[];
+}
+
+/// One address the service is answering on right now, maintained by the
+/// endpoints controller. This is what you point a reverse proxy at.
+export interface ServiceEndpoint {
+  workerName: string;
+  address: string;
+  nodePort: number;
+  containerName: string;
+}
+
+export interface ServiceStatus {
+  endpoints?: ServiceEndpoint[];
+}
+
+export interface Service {
+  metadata: ObjectMeta;
+  spec: ServiceSpec;
+  status?: ServiceStatus;
+}
+
 export interface List<T> {
   items: T[];
 }

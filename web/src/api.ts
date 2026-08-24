@@ -1,6 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { logout, sessionToken } from "./auth";
-import type { Container, Lease, List, RestartPolicy, Worker } from "./types";
+import type { Container, Lease, List, RestartPolicy, Service, Worker } from "./types";
 
 // The API is same-origin: the server serves this bundle in production, and
 // the Vite dev server proxies these paths to it. The browser sends its admin
@@ -124,6 +124,57 @@ export function useDeleteContainer() {
   return useMutation({
     mutationFn: (name: string) => http<void>(`/containers/${name}`, { method: "DELETE" }),
     onSuccess: () => qc.invalidateQueries({ queryKey: ["containers"] }),
+  });
+}
+
+// ── Services ───────────────────────────────────────────────────────────────
+
+export function useServices() {
+  return useQuery({
+    queryKey: ["services"],
+    queryFn: () => http<List<Service>>("/services"),
+    refetchInterval: REFRESH_MS,
+    select: (d) => d.items ?? [],
+  });
+}
+
+export interface NewService {
+  name: string;
+  selector: Record<string, string>;
+  targetPort: number;
+  /// Left undefined to let the server allocate from 30000-32767.
+  nodePort?: number;
+}
+
+export function useCreateService() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (s: NewService) =>
+      http<Service>("/services", {
+        method: "POST",
+        body: JSON.stringify({
+          metadata: { name: s.name },
+          spec: {
+            selector: s.selector,
+            ports: [
+              // Omit nodePort entirely rather than sending 0 or null: the server
+              // allocates only when the field is absent.
+              s.nodePort
+                ? { targetPort: s.targetPort, nodePort: s.nodePort }
+                : { targetPort: s.targetPort },
+            ],
+          },
+        }),
+      }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["services"] }),
+  });
+}
+
+export function useDeleteService() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (name: string) => http<void>(`/services/${name}`, { method: "DELETE" }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["services"] }),
   });
 }
 

@@ -190,3 +190,49 @@ struct BootstrapTokenInfo {
     secret: String,
     expires_at: DateTimeUtc,
 }
+
+// ---------------------------------------------------------------------------
+// Service — a stable name in front of a moving set of containers.
+// ---------------------------------------------------------------------------
+
+/// One port a `Service` exposes.
+///
+/// Velos has no cluster IP. Each worker's container network is its own island
+/// (Apple Containerization hands every worker the same `192.168.64.0/24`, and
+/// it is not routable off that Mac), so there is nothing for a virtual service
+/// IP to live on. Kubernetes' `port` field — the cluster-IP port — is therefore
+/// deliberately absent: a service port is a `nodePort` bound on every worker
+/// running a selected container, forwarded to `targetPort` inside it.
+///
+/// `nodePort` is server-assigned at admission when the caller leaves it unset,
+/// like `uid` and `resourceVersion`; a stored `ServicePort` always has one.
+struct ServicePort {
+    name: String,
+    target_port: u32,
+    node_port: u32,
+}
+
+struct ServiceSpec {
+    selector: Map<String, String>,
+    ports: Vec<ServicePort>,
+}
+
+/// One address the service is answering on right now. Maintained by the
+/// endpoints controller from container placement and worker addresses — this
+/// is what an external load balancer is told to send traffic to.
+struct ServiceEndpoint {
+    worker_name: String,
+    address: String,
+    node_port: u32,
+    container_name: String,
+}
+
+struct ServiceStatus {
+    endpoints: Vec<ServiceEndpoint>,
+}
+
+struct Service {
+    metadata: ObjectMeta,
+    spec: ServiceSpec,
+    status: ServiceStatus,
+}

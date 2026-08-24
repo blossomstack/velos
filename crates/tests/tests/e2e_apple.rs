@@ -207,7 +207,9 @@ async fn real_container_lifecycle_with_apple_containerization() {
         .register(&json!({
             "name": NODE,
             "capacity": { "cpu": 4, "memoryBytes": 8589934592u64 },
-            "addresses": [],
+            // The same detection `veloslet setup` uses, so the endpoint this
+            // test asserts on is produced the way a real worker produces it.
+            "addresses": veloslet::host::detect_address(&base).into_iter().collect::<Vec<_>>(),
             "containerRuntimeVersion": "apple-containerization",
         }))
         .await
@@ -399,6 +401,147 @@ async fn real_container_lifecycle_with_apple_containerization() {
         "running",
         "resume must boot the same micro-VM back up"
     );
+
+    // --- Service: a real node port carrying real traffic to a real micro-VM ---
+    //
+    // This is the assumption the whole Service design rests on: a container's
+    // address on the worker's own network is dialable *from that worker*, so a
+    // userspace forwarder there can publish it. `container run --publish` is not
+    // used and cannot be — on apple/container 1.0.0 it binds the host port and
+    // then fails to reach the container behind it, accepting connections and
+    // dropping them. If a future runtime release breaks the direct path too,
+    // this test is what says so.
+    let resp = http
+        .post(format!("{base}/api/v1/containers"))
+        .bearer_auth(&credential)
+        .json(&json!({
+            "metadata": {
+                "name": "c-web",
+                "labels": { "app": "web" },
+                "finalizers": ["veloslet"]
+            },
+            "spec": {
+                "image": IMAGE,
+                // A one-shot responder in a loop: busybox `nc` serves one
+                // connection and exits, so the loop is what makes it a server.
+                "command": ["sh", "-c",
+                    "printf 'HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\nhi\n' > /m; \
+                     while true; do nc -l -p 8080 < /m > /dev/null; done"],
+                "restartPolicy": "Always",
+                "resources": { "cpu": 1, "memoryBytes": 536870912u64 }
+            },
+            "status": { "phase": "Pending" }
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
+    await_phase(
+        &http,
+        &base,
+        &credential,
+        "c-web",
+        &["Running"],
+        Duration::from_secs(120),
+    )
+    .await;
+
+    let resp = http
+        .post(format!("{base}/api/v1/services"))
+        .bearer_auth(&credential)
+        .json(&json!({
+            "metadata": { "name": "web" },
+            "spec": {
+                "selector": { "app": "web" },
+                "ports": [{ "targetPort": 8080 }]
+            }
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
+    let svc: Value = resp.json().await.unwrap();
+    let node_port = svc["spec"]["ports"][0]["nodePort"].as_u64().unwrap() as u16;
+
+    // The running `veloslet` loop opens the port on its next pass.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let body = loop {
+        if let Ok(Ok(resp)) = tokio::time::timeout(
+            Duration::from_secs(5),
+            reqwest::Client::new()
+                .get(format!("http://127.0.0.1:{node_port}/"))
+                .send(),
+        )
+        .await
+            && let Ok(text) = resp.text().await
+        {
+            break text;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "node port {node_port} never carried traffic to the container"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    };
+    assert_eq!(body.trim(), "hi", "node port reached something else");
+
+    // And the control plane publishes where that port answers, which is what an
+    // external proxy is configured from.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let svc: Value = http
+            .get(format!("{base}/api/v1/services/web"))
+            .bearer_auth(&credential)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let ep = &svc["status"]["endpoints"][0];
+        if ep["containerName"] == "c-web" {
+            assert_eq!(ep["workerName"], NODE);
+            assert_eq!(ep["nodePort"].as_u64(), Some(node_port as u64));
+            assert!(
+                ep["address"].as_str().is_some_and(|a| !a.is_empty()),
+                "an endpoint without an address is not reachable by anything"
+            );
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the service never published an endpoint: {svc}"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
+    // Deleting the container must take the listener with it: a node port that
+    // keeps accepting after its backend is gone looks healthy to a load
+    // balancer while black-holing every request.
+    http.delete(format!("{base}/api/v1/containers/c-web"))
+        .bearer_auth(&credential)
+        .send()
+        .await
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        if tokio::net::TcpStream::connect(("127.0.0.1", node_port))
+            .await
+            .is_err()
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "node port {node_port} still accepting after its container was deleted"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    http.delete(format!("{base}/api/v1/services/web"))
+        .bearer_auth(&credential)
+        .send()
+        .await
+        .unwrap();
 
     // Clean up the real micro-VM through the finalizer protocol.
     http.delete(format!("{base}/api/v1/containers/c-sleep"))
