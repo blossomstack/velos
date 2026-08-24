@@ -4,8 +4,8 @@ import { useContainers, useDeleteContainer, useHibernateContainer, useResumeCont
 import { Card, EmptyState, Labels, PhaseBadge, Spinner } from "../ui";
 import { Drawer, Field, Json } from "../components/Drawer";
 import { CreateContainer } from "../components/CreateContainer";
-import { ageFrom, fmtBytes, phaseOf } from "../format";
-import type { Container, ContainerPhase } from "../types";
+import { ageFrom, cpuOf, fmtBytes, isTerminating, memOf, phaseOf } from "../format";
+import type { Container, ContainerPhase, NodeAffinity, Toleration } from "../types";
 
 const FILTERS: (ContainerPhase | "All")[] = [
   "All",
@@ -62,7 +62,10 @@ export function Containers() {
         </button>
       </div>
 
-      <Card>
+      {/* The Node column carries a worker name on every scheduled row, which
+          pushes this table past a narrow viewport — and with nothing to scroll,
+          the right-hand columns are simply unreachable. */}
+      <Card className="overflow-x-auto">
         {isLoading ? (
           <Spinner />
         ) : rows.length === 0 ? (
@@ -98,7 +101,10 @@ export function Containers() {
                     </div>
                   </td>
                   <td className="px-5 py-3">
-                    <PhaseBadge phase={phaseOf(c)} />
+                    <span className="flex flex-wrap items-center gap-1.5">
+                      <PhaseBadge phase={phaseOf(c)} />
+                      <TerminatingChip container={c} />
+                    </span>
                     {/* A container the worker cannot launch keeps its phase —
                         it really is still Scheduled — so the phase alone reads
                         as "any moment now" for something that will never
@@ -113,13 +119,15 @@ export function Containers() {
                     )}
                   </td>
                   <td className="px-5 py-3 font-mono text-xs text-zinc-400">{c.spec.image}</td>
-                  <td className="px-5 py-3 text-zinc-400">
+                  <td className="whitespace-nowrap px-5 py-3 text-zinc-400">
                     <NodeCell container={c} />
                   </td>
-                  <td className="px-5 py-3 text-zinc-400">
-                    {c.spec.resources?.cpu ?? 1} cpu · {fmtBytes(c.spec.resources?.memoryBytes)}
+                  <td className="whitespace-nowrap px-5 py-3 text-zinc-400">
+                    {cpuOf(c)} cpu · {fmtBytes(memOf(c))}
                   </td>
-                  <td className="px-5 py-3 text-zinc-500">{ageFrom(c.metadata.creationTimestamp)}</td>
+                  <td className="whitespace-nowrap px-5 py-3 text-zinc-500">
+                    {ageFrom(c.metadata.creationTimestamp)}
+                  </td>
                   <td className="px-5 py-3 text-right">
                     {phaseOf(c) === "Hibernated" ? (
                       <button
@@ -190,6 +198,102 @@ function NodeCell({ container }: { container: Container }) {
   return <span className="text-zinc-600">unscheduled</span>;
 }
 
+function isTerminal(phase: ContainerPhase): boolean {
+  return phase === "Succeeded" || phase === "Failed";
+}
+
+/// Whether this phase's status still carries the details of the run — when the
+/// container started, and the instance it started as.
+///
+/// The worker writes status through the status subresource, which replaces the
+/// *whole* document, and neither its terminal nor its hibernated status restates
+/// those two fields. So they are genuinely gone once a container finishes or goes
+/// to sleep — deliberately, since neither still describes anything live.
+function keepsRunDetail(phase: ContainerPhase): boolean {
+  return !isTerminal(phase) && phase !== "Hibernated";
+}
+
+/// An absent field, distinguishing the two reasons it can be absent.
+///
+/// "Not yet" and "no longer carried" are different answers, and rendering both
+/// as an em dash makes a `Succeeded` container look like one whose start time is
+/// unknown — when in fact it certainly started, and the phase that replaced its
+/// status simply did not restate it.
+function Absent({ retained }: { retained: boolean }) {
+  if (retained) return <>—</>;
+  return (
+    <span
+      className="text-zinc-600 italic"
+      title="the worker replaces the whole status document on each phase change, and this phase does not restate this field"
+    >
+      not retained
+    </span>
+  );
+}
+
+/// A container the user has deleted that is still listed.
+///
+/// `DELETE` on a container holding the worker's finalizer marks
+/// `metadata.deletionTimestamp` and leaves the object in place until the worker
+/// has torn the micro-VM down (the finalizer protocol in
+/// `crates/server/src/lib.rs`). Its phase is unchanged and still truthful — it
+/// really is `Running` — so with nothing else drawn, a delete looks like a
+/// button that did nothing.
+function TerminatingChip({ container }: { container: Container }) {
+  if (!isTerminating(container)) return null;
+  return (
+    <span
+      className="inline-flex items-center gap-1.5 rounded-full bg-rose-400/10 px-2.5 py-0.5 text-xs font-medium text-rose-300 ring-1 ring-inset ring-rose-400/30"
+      title={`deleting since ${container.metadata.deletionTimestamp}`}
+    >
+      <span className="h-1.5 w-1.5 rounded-full bg-rose-400 live-dot" />
+      Terminating
+    </span>
+  );
+}
+
+function TolerationList({ tolerations }: { tolerations: Toleration[] }) {
+  return (
+    <div className="flex flex-wrap gap-1">
+      {tolerations.map((t, i) => (
+        <span
+          key={`${t.key}-${i}`}
+          className="rounded bg-white/[0.04] px-1.5 py-0.5 font-mono text-[11px] text-zinc-400 ring-1 ring-inset ring-white/5"
+        >
+          {t.key}
+          {t.operator === "Exists" ? "" : `=${t.value ?? ""}`}
+          {t.effect ? `:${t.effect}` : ""}
+        </span>
+      ))}
+    </div>
+  );
+}
+
+/// Affinity, counted rather than unrolled. The full term tree is in the raw
+/// object below; what the eye needs here is the distinction that changes the
+/// outcome — a required term can strand this container forever, a preferred one
+/// only nudges the score.
+function AffinitySummary({ affinity }: { affinity: NodeAffinity }) {
+  const required = affinity.required?.length ?? 0;
+  const preferred = affinity.preferred?.length ?? 0;
+  if (required === 0 && preferred === 0) return <span className="text-zinc-600">—</span>;
+  return (
+    <span className="text-xs">
+      {required > 0 && (
+        <span className="text-amber-300">
+          {required} required {required === 1 ? "term" : "terms"}
+        </span>
+      )}
+      {required > 0 && preferred > 0 && <span className="text-zinc-600"> · </span>}
+      {preferred > 0 && (
+        <span className="text-zinc-400">
+          {preferred} preferred {preferred === 1 ? "term" : "terms"}
+        </span>
+      )}
+    </span>
+  );
+}
+
 function ContainerDrawer({ container, onClose }: { container: Container | null; onClose: () => void }) {
   if (!container) return <Drawer open={false} onClose={onClose} title="" children={null} />;
   const s = container.status ?? {};
@@ -197,7 +301,13 @@ function ContainerDrawer({ container, onClose }: { container: Container | null; 
     <Drawer
       open={!!container}
       onClose={onClose}
-      title={<span className="flex items-center gap-3">{container.metadata.name}<PhaseBadge phase={phaseOf(container)} /></span>}
+      title={
+        <span className="flex flex-wrap items-center gap-3">
+          {container.metadata.name}
+          <PhaseBadge phase={phaseOf(container)} />
+          <TerminatingChip container={container} />
+        </span>
+      }
       subtitle={`Container · uid ${container.metadata.uid ?? "—"}`}
     >
       <div className="divide-y divide-white/5">
@@ -213,13 +323,46 @@ function ContainerDrawer({ container, onClose }: { container: Container | null; 
         <Field label="Restart policy">{container.spec.restartPolicy ?? "Never"}</Field>
         <Field label="Desired state">{container.spec.desiredState ?? "Running"}</Field>
         <Field label="Resources">
-          {container.spec.resources?.cpu ?? 1} cores · {fmtBytes(container.spec.resources?.memoryBytes)}
+          {cpuOf(container)} cores · {fmtBytes(memOf(container))}
+          {!container.spec.resources && <span className="text-zinc-600"> (default)</span>}
         </Field>
+        {/* The placement constraints, which are the answer to "why is this
+            Pending" whenever the reason is not capacity. They decide real
+            scheduler outcomes, so they do not belong only in the raw JSON. */}
+        {container.spec.nodeSelector && Object.keys(container.spec.nodeSelector).length > 0 && (
+          <Field label="Node selector">
+            <Labels labels={container.spec.nodeSelector} />
+          </Field>
+        )}
+        {container.spec.tolerations && container.spec.tolerations.length > 0 && (
+          <Field label="Tolerations">
+            <TolerationList tolerations={container.spec.tolerations} />
+          </Field>
+        )}
+        {container.spec.affinity && (
+          <Field label="Node affinity">
+            <AffinitySummary affinity={container.spec.affinity} />
+          </Field>
+        )}
         <Field label="Container ID">
-          <span className="font-mono text-xs">{s.containerID ?? "—"}</span>
+          <span className="font-mono text-xs">
+            {s.containerID ?? <Absent retained={keepsRunDetail(phaseOf(container))} />}
+          </span>
         </Field>
-        <Field label="Started">{s.startedAt ? `${ageFrom(s.startedAt)} ago` : "—"}</Field>
-        <Field label="Hibernated">{s.hibernatedAt ? `${ageFrom(s.hibernatedAt)} ago` : "—"}</Field>
+        <Field label="Started">
+          {s.startedAt ? (
+            `${ageFrom(s.startedAt)} ago`
+          ) : (
+            <Absent retained={keepsRunDetail(phaseOf(container))} />
+          )}
+        </Field>
+        <Field label="Hibernated">
+          {s.hibernatedAt ? (
+            `${ageFrom(s.hibernatedAt)} ago`
+          ) : (
+            <Absent retained={!isTerminal(phaseOf(container))} />
+          )}
+        </Field>
         <Field label="Finished">{s.finishedAt ? `${ageFrom(s.finishedAt)} ago` : "—"}</Field>
         <Field label="Exit code">{s.exitCode ?? "—"}</Field>
         {s.reason && (
@@ -229,7 +372,7 @@ function ContainerDrawer({ container, onClose }: { container: Container | null; 
         )}
         {s.message && (
           <Field label="Message">
-            <span className="font-mono text-xs break-all">{s.message}</span>
+            <span className="font-mono text-xs break-words">{s.message}</span>
           </Field>
         )}
         <Field label="Created">{ageFrom(container.metadata.creationTimestamp)} ago</Field>

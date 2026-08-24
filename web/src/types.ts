@@ -33,6 +33,46 @@ export interface ResourceSpec {
   memoryBytes?: number;
 }
 
+export type TaintEffect = "NoSchedule" | "PreferNoSchedule";
+
+export type NodeSelectorOperator = "In" | "NotIn" | "Exists" | "DoesNotExist" | "Gt" | "Lt";
+
+export interface NodeSelectorRequirement {
+  key: string;
+  operator: NodeSelectorOperator;
+  values?: string[];
+}
+
+export interface NodeSelectorTerm {
+  matchExpressions?: NodeSelectorRequirement[];
+}
+
+export interface PreferredSchedulingTerm {
+  weight: number;
+  preference: NodeSelectorTerm;
+}
+
+/// Required terms are a hard filter (any one may match); preferred ones only
+/// move a worker's score. A container can be `Pending` forever because of the
+/// first and never because of the second.
+export interface NodeAffinity {
+  required?: NodeSelectorTerm[];
+  preferred?: PreferredSchedulingTerm[];
+}
+
+export interface Taint {
+  key: string;
+  value?: string;
+  effect: TaintEffect;
+}
+
+export interface Toleration {
+  key: string;
+  operator: "Equal" | "Exists";
+  value?: string;
+  effect?: TaintEffect;
+}
+
 export interface ContainerSpec {
   image: string;
   command?: string[];
@@ -40,7 +80,13 @@ export interface ContainerSpec {
   resources?: ResourceSpec;
   restartPolicy?: RestartPolicy;
   desiredState?: DesiredState;
+  /// The worker the *user* pinned this container to — a hard filter on
+  /// placement, not a record of it. Where the container actually landed is
+  /// `status.workerName`.
   nodeName?: string;
+  nodeSelector?: Record<string, string>;
+  affinity?: NodeAffinity;
+  tolerations?: Toleration[];
 }
 
 export interface ContainerStatus {
@@ -92,9 +138,15 @@ export interface WorkerStatus {
   nodeInfo?: NodeSystemInfo;
 }
 
+export interface WorkerSpec {
+  /// Cordoned: the worker keeps running what it has and takes nothing new.
+  unschedulable?: boolean;
+  taints?: Taint[];
+}
+
 export interface Worker {
   metadata: ObjectMeta;
-  spec: { unschedulable?: boolean };
+  spec: WorkerSpec;
   status?: WorkerStatus;
 }
 
