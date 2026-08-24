@@ -300,7 +300,7 @@ fn check_reachable(server: &str, reach: &Reachability) -> Check {
         Reachability::NoTlsSupport => Check::fail(
             "reachable",
             format!("{server} is https, and this velosctl was built without TLS support"),
-            "use an http:// URL, or tunnel to the server (ssh -L 8080:127.0.0.1:8080 <host>)",
+            "reinstall an official release build, or rebuild with reqwest's `rustls` feature",
         ),
         Reachability::Unreachable(why) => Check::fail(
             "reachable",
@@ -505,8 +505,12 @@ async fn observe_reachability(http: &reqwest::Client, server: &str) -> Reachabil
 
 /// Tell a missing TLS backend apart from a server that is simply down: without
 /// one, reqwest rejects an https URL up front with "scheme is not http" rather
-/// than failing to connect. A TLS-capable build never produces that error, so
-/// this classification stays correct if the backend is ever added.
+/// than failing to connect.
+///
+/// The published builds enable reqwest's `rustls` feature, so this arm no longer
+/// fires for them. It is kept for a build that drops the feature: the symptom is
+/// a URL-shaped error message that names the URL and hides the cause, which
+/// reads as "bad URL" or "server down" and costs an afternoon to place.
 fn classify_transport(server: &str, cause: String) -> Reachability {
     if server.starts_with("https://") && cause.contains("scheme is not http") {
         return Reachability::NoTlsSupport;

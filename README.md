@@ -106,16 +106,17 @@ bound, the placement is recorded in `status.workerName` and never re-evaluated.
 
 ## Getting started
 
-Install the CLI:
+Install the client tools:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/blossomstack/velos/main/install.sh | sh
 ```
 
 That downloads the latest release for your platform, checks it against its published
-SHA-256, and installs `velosctl` into `~/.local/bin`. Useful flags: `--components all`
-(also install `velos-server` and `veloslet`), `--bin-dir /usr/local/bin`,
-`--version v0.1.3`. Prefer cargo? `cargo install velos-server velosctl veloslet`.
+SHA-256, and installs `velosctl` (drive the control plane) and `veloslet` (join it as
+a worker) into `~/.local/bin`. Useful flags: `--components all` (also install
+`velos-server`), `--components velosctl` (just the CLI), `--bin-dir /usr/local/bin`,
+`--version v0.2.0`. Prefer cargo? `cargo install velos-server velosctl veloslet`.
 Or build from source with `make build` (which also builds the embedded dashboard).
 
 At any point, **`velosctl doctor`** checks your setup — config file, server URL,
