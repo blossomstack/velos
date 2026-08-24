@@ -158,6 +158,12 @@ curl -fsSL -o "$tmp/$tarball" "$base_url/$tarball" \
 # handles and reports itself, so curl's own error line only adds noise.
 curl -fsL -o "$tmp/$tarball.sha256" "$base_url/$tarball.sha256" \
     || die "no checksum published for $tarball — refusing to install an unverified binary"
+# Check the file names our tarball before trusting the verifier: GNU sha256sum
+# exits 0 on a file with no checksum lines in it, so an empty or wrong-asset
+# checksum would otherwise verify as a pass.
+if ! grep -qF "$tarball" "$tmp/$tarball.sha256"; then
+    die "the checksum published for $tarball is empty or names another file — refusing to install"
+fi
 if ! (cd "$tmp" && sha_verify "$tarball.sha256") >/dev/null 2>&1; then
     die "checksum mismatch for $tarball — refusing to install"
 fi
