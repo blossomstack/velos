@@ -212,28 +212,39 @@ has expired (or been revoked) stops *new* workers joining without disturbing any
 worker already in the fleet. Revoking a worker's credential — which is what
 deleting the worker does — is the way to evict one for good.
 
+Joining happens exactly once, in `veloslet setup`. It is the only command that
+can mint a credential, so a join token never reaches the config file or the
+process table.
+
 ```bash
 # As the logged-in admin, mint a bootstrap token and assemble it as `tokenId.secret`.
 TOKEN=$(velosctl token create | jq -r '"\(.tokenId).\(.secret)"')
 
-# Run the worker agent in the foreground. It registers on start, then renews its lease.
-veloslet run --server http://127.0.0.1:8080 --node "$(hostname -s)" --token "$TOKEN" \
+# On the worker machine: join, and write ~/.velos/veloslet.json.
+veloslet setup --server http://127.0.0.1:8080 --node "$(hostname -s)" --token "$TOKEN" \
   --cpu 8 --memory 16G
+
+# Then run the worker. It re-registers on start and renews its lease.
+veloslet run
 ```
 
-`veloslet run` flags (also accepted via `--config`, see below):
+`veloslet setup` flags:
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--config` | — | path to a JSON config file holding the settings below |
 | `--server` | *(required)* | control-plane base URL |
 | `--node` | *(required)* | this worker's unique name |
-| `--token` | *(required to join)* | join token, consumed by the first successful registration. Not needed once the config holds a credential; passing it again re-joins from scratch |
+| `--token` | *(required)* | join token, traded for a credential here and never written to disk |
 | `--cpu` | *(required)* | advertised CPU cores; must not exceed the machine's |
 | `--memory` | *(required)* | advertised memory, e.g. `16G`; must not exceed the machine's |
 | `--reconcile-secs` | `5` | how often it reconciles its containers |
 | `--heartbeat-secs` | `10` | how often it renews its lease |
 | `--lease-secs` | `40` | lease duration; not renewed in time → worker goes `NotReady` |
+| `--config` | `~/.velos/veloslet.json` | where to write the config |
+
+Nothing is written unless the join succeeds, so a failed `setup` leaves the
+machine exactly as it was — there is no half-joined config for `run` to puzzle
+over.
 
 Within a few seconds the worker reports **Ready** (its lease is fresh):
 
@@ -241,38 +252,57 @@ Within a few seconds the worker reports **Ready** (its lease is fresh):
 velosctl get workers
 ```
 
+### Reading and changing the config
+
+`veloslet config` edits the file `setup` wrote. Fields are named, not free-form
+keys, so a typo is rejected up front instead of landing in the file:
+
+```bash
+veloslet config show               # whole config as JSON, credential redacted
+veloslet config get cpu            # one field
+veloslet config set --cpu 12 --memory 24G
+veloslet config path               # where the file is
+```
+
+Settable fields are `server`, `node`, `cpu`, `memory`, `reconcile-secs`,
+`heartbeat-secs` and `lease-secs`. Two things `config` will not do: print or set
+the **credential** (it is earned by `setup`, not declared — `show` redacts it),
+and **rename a worker that has already joined**, because its credential is bound
+to the name the server issued it for. Changing `--cpu`/`--memory` is validated
+against the host straight away, so an impossible value fails while you are still
+looking at the terminal rather than at the next restart.
+
+Restart the worker for a change to take effect.
+
 ### Run as a background daemon
 
-`veloslet install` sets the worker up as a long-running service (a launchd
+`veloslet run -d` runs the same worker as a long-running service (a launchd
 **LaunchAgent** on macOS) so it starts at login and restarts on crash:
 
 ```bash
-veloslet install --server http://127.0.0.1:8080 --node "$(hostname -s)" --token "$TOKEN" \
-  --cpu 8 --memory 16G
+veloslet run -d
 ```
 
-`--cpu` and `--memory` are required and validated against the host: the worker
-refuses to start (or install) if you advertise more than the machine physically
-has. Memory accepts human sizes (`512M`, `8G`, base-1024). After upgrading from a
-build that hardcoded capacity, existing installs must be re-run with these flags
-(or have `cpu`/`memory` added to `~/.velos/veloslet.json`) before the worker will
-start.
+It uses the config `setup` already wrote, so it takes no server, node or token
+flags at all — and it refuses to start a worker that has not joined, rather than
+leaving a background process that cannot authenticate. Capacity is re-validated
+against the host here too.
 
-This writes the settings to `~/.velos/veloslet.json` (mode `0600` — it holds the
-secrets, so they're kept out of the process arguments), loads the agent, and
-starts it. On the first successful registration the worker rewrites that file,
-replacing `token` with the `credential` it was issued.
-The agent then runs `veloslet run --config ~/.velos/veloslet.json`. Logs go to
-`~/Library/Logs/veloslet.{out,err}.log`. Remove it with:
+The agent runs `veloslet run --config ~/.velos/veloslet.json`. Logs go to
+`~/Library/Logs/veloslet.{out,err}.log`. Two ways to take it away:
 
 ```bash
-veloslet uninstall            # stop & unload the agent (keeps config + bundle)
-veloslet uninstall --purge    # also delete the app bundle and config
+veloslet stop         # unload the agent; bundle and config stay, `run -d` restarts it
+veloslet uninstall    # remove the agent, the app bundle, and the config for good
 ```
+
+`uninstall` deletes the credential along with the config, so rejoining afterwards
+needs a fresh join token and another `veloslet setup`. Use `stop` if you only
+want the worker to stand down for a while.
 
 > **macOS Local Network privacy.** A bare launchd agent is silently blocked from
 > reaching a server on your LAN, because it has no GUI app for macOS to attribute
-> the connection to. To work around this (per Apple TN3179), `install` wraps the
+> the connection to. To work around this (per Apple TN3179), `run -d` wraps the
 > binary in a small code-signed app bundle (`~/Applications/Velos.app`) with a
 > bundle identifier and an `NSLocalNetworkUsageDescription`, and references it from
 > the agent via `AssociatedBundleIdentifiers`. The first time it connects, macOS
@@ -440,8 +470,8 @@ that fixes it. The table below covers the rest.
 | Container stuck in `Pending` | Created without `status.phase: "Pending"`, or no worker is `Ready` / has capacity. |
 | Container goes straight to `Failed` | The runtime couldn't run it (image pull failed, or the `container` CLI is missing on the worker). Check the `veloslet` logs. |
 | Worker shows `NotReady` | `veloslet` isn't renewing its lease — confirm it's running and can reach the server. |
-| Daemon (`veloslet install`) logs `error sending request` and never registers | On macOS, the **Local Network** prompt wasn't approved — enable *Velos Worker* under System Settings → Privacy & Security → Local Network (see §5). Note: this grant can't be reset with `tccutil`; it persists per bundle id even after the app is deleted. |
-| Worker logs `register failed, retrying in 10s: server returned 401` | Its secret is no longer accepted. Before it has joined, that means the join token expired or was revoked — mint a new one and re-run `veloslet install --token …`. After it has joined, it means the worker was deleted (which revokes its credential); it must join again. |
+| Daemon (`veloslet run -d`) logs `error sending request` and never registers | On macOS, the **Local Network** prompt wasn't approved — enable *Velos Worker* under System Settings → Privacy & Security → Local Network (see §5). Note: this grant can't be reset with `tccutil`; it persists per bundle id even after the app is deleted. |
+| Worker logs `register failed, retrying in 10s: server returned 401` | Its credential is no longer accepted — the worker was deleted, which revokes it. Mint a new join token and run `veloslet setup` again. (A join token expiring cannot cause this: `setup` consumes it and a running worker never presents one.) |
 | Dashboard says "server unreachable" | The server isn't running, or you opened the dev server while the server is down. |
 | `address already in use` on start | Something already holds `:8080` — `lsof -nP -iTCP:8080 -sTCP:LISTEN`. |
 
@@ -453,7 +483,7 @@ pkill -f velos-server
 pkill -f veloslet
 
 # If the worker was installed as a daemon (macOS), remove the LaunchAgent:
-veloslet uninstall --purge
+veloslet uninstall
 
 # Forget the saved CLI credential
 velosctl logout

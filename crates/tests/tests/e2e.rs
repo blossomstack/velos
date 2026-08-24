@@ -9,7 +9,7 @@ use std::sync::Arc;
 use velos_runtime::{ContainerRuntime, FakeRuntime};
 use velos_server::{app, controllers};
 use velos_store::{SqliteStore, Store};
-use veloslet::daemon::{Bearer, WorkerConfig};
+use veloslet::daemon::{self, Bearer, WorkerConfig};
 use veloslet::memory::Memory;
 use veloslet::{ApiClient, run_once};
 
@@ -417,19 +417,24 @@ fn registration(cfg: &WorkerConfig) -> serde_json::Value {
     })
 }
 
-/// One `veloslet` start: present whatever secret the config holds, register,
-/// and fold the response back in — exactly what `veloslet run` does, minus the
-/// container runtime. Returns the config as it would be left on disk.
-async fn worker_start(base: &str, cfg: WorkerConfig) -> WorkerConfig {
+/// `veloslet setup`: present the one-shot join token, register, and keep the
+/// credential the server mints. Returns the config as it would be left on disk.
+async fn worker_setup(base: &str, cfg: &WorkerConfig, join_token: &str) -> WorkerConfig {
+    let bearer = Bearer::Join(join_token.to_string());
+    let client = ApiClient::new(base, Some(bearer.expose().to_string()));
+    let resp = client.register(&registration(cfg)).await.unwrap();
+    let credential = daemon::credential_from_response(&resp).unwrap();
+    cfg.with_credential(credential)
+}
+
+/// One `veloslet run` start: re-register as itself to refresh what it
+/// advertises — exactly what `run` does, minus the container runtime.
+async fn worker_start(base: &str, cfg: &WorkerConfig) {
     let bearer = cfg
         .bearer()
-        .expect("a worker must have a secret to present");
+        .expect("a worker must have a credential to present");
     let client = ApiClient::new(base, Some(bearer.expose().to_string()));
-    let resp = client.register(&registration(&cfg)).await.unwrap();
-    match cfg.adopt(&bearer, &resp).unwrap() {
-        Some(joined) => joined,
-        None => cfg,
-    }
+    client.register(&registration(cfg)).await.unwrap();
 }
 
 #[tokio::test]
@@ -446,7 +451,6 @@ async fn a_joined_worker_restarts_after_its_join_token_is_gone() {
     let cfg = WorkerConfig {
         server: base.clone(),
         node: "w1".to_string(),
-        token: Some(boot_tok.clone()),
         credential: None,
         cpu: 4,
         memory: Memory::from_bytes(8 * 1024 * 1024 * 1024),
@@ -455,11 +459,17 @@ async fn a_joined_worker_restarts_after_its_join_token_is_gone() {
         lease_secs: 40,
     };
 
-    // First start: joins, and trades the join token for a credential.
-    let cfg = worker_start(&base, cfg).await;
-    assert_eq!(cfg.token, None, "the join token must be consumed");
+    // `setup`: trade the join token for a credential.
+    let cfg = worker_setup(&base, &cfg, &boot_tok).await;
     let credential = cfg.credential.clone().expect("a credential was issued");
     assert!(credential.starts_with("w1."));
+    // The join token is not merely cleared, it has nowhere to live: what gets
+    // written to disk cannot carry one.
+    let on_disk = serde_json::to_string(&cfg).unwrap();
+    assert!(
+        !on_disk.contains(&boot_tok),
+        "the join token reached the config file: {on_disk}"
+    );
 
     // The admin retires the join token — the same state an expiry produces.
     let r = http
@@ -475,14 +485,13 @@ async fn a_joined_worker_restarts_after_its_join_token_is_gone() {
 
     // Restart, reading the config back off disk. It must still come up, and
     // still hold the same credential afterwards.
-    let text = serde_json::to_string(&cfg).unwrap();
-    let from_disk: WorkerConfig = serde_json::from_str(&text).unwrap();
+    let from_disk: WorkerConfig = serde_json::from_str(&on_disk).unwrap();
     assert_eq!(
         from_disk.bearer().unwrap(),
         Bearer::Credential(credential.clone())
     );
-    let after = worker_start(&base, from_disk).await;
-    assert_eq!(after.credential, Some(credential.clone()));
+    worker_start(&base, &from_disk).await;
+    assert_eq!(from_disk.credential, Some(credential.clone()));
 
     // And it can do its job: renew its lease with that credential.
     ApiClient::new(&base, Some(credential))

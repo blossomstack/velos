@@ -1,3 +1,17 @@
+//! The `veloslet` command line.
+//!
+//! The worker's life has three verbs and one noun:
+//!
+//! - `setup` joins a control plane once and writes the config, credential included.
+//! - `config` reads and edits that config afterwards.
+//! - `run` runs the worker loop, in this terminal or (`-d`) as a background
+//!   LaunchAgent; `stop` and `uninstall` take the background one away again.
+//!
+//! Joining is deliberately not something `run` can do. A credential is earned by
+//! `setup` and nothing else, so there is exactly one way for a worker to acquire
+//! an identity, and a join token never reaches the config file or the process
+//! table (Principles #2 and #6).
+
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command as Process;
@@ -7,6 +21,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use velos_runtime::{AppleContainer, ContainerRuntime};
+use veloslet::config::{self, Edits, Field};
 use veloslet::daemon::{self, BUNDLE_EXECUTABLE, BUNDLE_ID, Bearer, WorkerConfig};
 use veloslet::host::{detect_host, detect_system_info, validate_capacity};
 use veloslet::memory::Memory;
@@ -24,65 +39,81 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// Run the worker loop in the foreground (this is what the LaunchAgent
-    /// invokes). Reads `--config` and/or the individual flags.
+    /// Join a control plane and write the worker config, credential included.
+    /// Run this once per machine, before `run`.
+    Setup(SetupArgs),
+    /// Read or edit the worker config.
+    Config {
+        #[command(subcommand)]
+        command: ConfigCommand,
+    },
+    /// Run the worker loop — in this terminal, or with `-d` as a background
+    /// macOS LaunchAgent.
     Run(RunArgs),
-    /// Install and start the worker as a macOS launchd LaunchAgent: wraps the
-    /// binary in a signed app bundle (for Local Network privacy), writes the
-    /// config, and loads the agent.
-    Install(InstallArgs),
-    /// Stop and remove the LaunchAgent.
-    Uninstall(UninstallArgs),
+    /// Stop the background worker, leaving it installed so `run -d` starts it
+    /// again.
+    Stop(PathArgs),
+    /// Remove the background worker for good: LaunchAgent, app bundle, and the
+    /// config with its credential.
+    Uninstall(PathArgs),
 }
 
-#[derive(clap::Args, Debug)]
-struct RunArgs {
-    /// Path to a JSON config file (`~/.velos/veloslet.json` by convention).
+#[derive(Subcommand, Debug)]
+enum ConfigCommand {
+    /// Print the whole config as JSON, with the credential redacted.
+    Show(PathArgs),
+    /// Print one field's value.
+    Get {
+        /// Which field to read.
+        #[arg(value_enum)]
+        field: Field,
+        #[command(flatten)]
+        path: PathArgs,
+    },
+    /// Change one or more fields.
+    Set {
+        #[command(flatten)]
+        edits: Edits,
+        #[command(flatten)]
+        path: PathArgs,
+    },
+    /// Print the path of the config file.
+    Path(PathArgs),
+}
+
+/// The `--config` override, shared by every command that touches the file.
+#[derive(clap::Args, Debug, Clone, Default)]
+struct PathArgs {
+    /// Path to the worker config (default: ~/.velos/veloslet.json).
     #[arg(long)]
     config: Option<PathBuf>,
-    /// server base URL, e.g. http://127.0.0.1:8080 (overrides config).
-    #[arg(long)]
-    server: Option<String>,
-    /// This worker's name (overrides config).
-    #[arg(long)]
-    node: Option<String>,
-    /// Join token (`id.secret`). Only needed to join; passing it discards any
-    /// credential already in the config and joins again from scratch.
-    #[arg(long)]
-    token: Option<String>,
-    /// Advertised CPU cores (overrides config).
-    #[arg(long)]
-    cpu: Option<u32>,
-    /// Advertised memory, e.g. `8G` (overrides config).
-    #[arg(long)]
-    memory: Option<Memory>,
-    /// Reconcile interval in seconds.
-    #[arg(long)]
-    reconcile_secs: Option<u64>,
-    /// Heartbeat (lease renew) interval in seconds.
-    #[arg(long)]
-    heartbeat_secs: Option<u64>,
-    /// Lease duration in seconds.
-    #[arg(long)]
-    lease_secs: Option<u32>,
+}
+
+impl PathArgs {
+    fn resolve(&self) -> Result<PathBuf> {
+        match &self.config {
+            Some(p) => Ok(p.clone()),
+            None => config::default_path(),
+        }
+    }
 }
 
 #[derive(clap::Args, Debug)]
-struct InstallArgs {
+struct SetupArgs {
     /// server base URL, e.g. http://192.168.68.60:8088
     #[arg(long)]
     server: String,
     /// This worker's name.
     #[arg(long)]
     node: String,
-    /// Join token (`id.secret`), e.g. from `velosctl token create`. Consumed on
-    /// the first successful registration and replaced by a worker credential.
+    /// Join token (`id.secret`), e.g. from `velosctl token create`. Traded for a
+    /// worker credential here and never written to disk.
     #[arg(long)]
     token: String,
     /// Advertised CPU cores.
     #[arg(long)]
     cpu: u32,
-    /// Advertised memory, e.g. `8G`.
+    /// Advertised memory, e.g. 8G.
     #[arg(long)]
     memory: Memory,
     /// Reconcile interval in seconds.
@@ -94,20 +125,26 @@ struct InstallArgs {
     /// Lease duration in seconds.
     #[arg(long, default_value_t = 40)]
     lease_secs: u32,
+    #[command(flatten)]
+    path: PathArgs,
 }
 
 #[derive(clap::Args, Debug)]
-struct UninstallArgs {
-    /// Also delete the app bundle and the saved config file.
-    #[arg(long)]
-    purge: bool,
+struct RunArgs {
+    /// Run in the background as a macOS LaunchAgent instead of in this terminal.
+    #[arg(short = 'd', long = "daemon")]
+    daemon: bool,
+    #[command(flatten)]
+    path: PathArgs,
 }
 
 // ---------------------------------------------------------------------------
 // Paths
 // ---------------------------------------------------------------------------
 
-/// The on-disk locations the daemon owns, all under the user's home directory.
+/// The on-disk locations the background worker owns, all under the user's home
+/// directory. The config path comes from `config::default_path` (or `--config`)
+/// so there is one answer to "where does the config live".
 struct Paths {
     bundle_dir: PathBuf,
     bundle_bin: PathBuf,
@@ -122,14 +159,14 @@ struct Paths {
 }
 
 impl Paths {
-    fn resolve() -> Result<Self> {
+    fn resolve(config_file: PathBuf) -> Result<Self> {
         let home = dirs::home_dir().context("could not determine home directory")?;
         let bundle_dir = home.join("Applications/Velos.app");
         Ok(Self {
             bundle_bin: bundle_dir.join("Contents/MacOS").join(BUNDLE_EXECUTABLE),
             info_plist: bundle_dir.join("Contents/Info.plist"),
             bundle_dir,
-            config_file: home.join(".velos/veloslet.json"),
+            config_file,
             codesign_dir: home.join(".velos/codesign"),
             agent_plist: home
                 .join("Library/LaunchAgents")
@@ -146,84 +183,31 @@ fn path_str(p: &Path) -> Result<&str> {
 }
 
 // ---------------------------------------------------------------------------
-// run
+// setup
 // ---------------------------------------------------------------------------
 
-/// Resolve the config to run with, plus the path to write it back to once the
-/// join is consumed. Without `--config` there is nowhere to persist, so the
-/// worker re-joins on every start (a foreground/dev mode, not how the
-/// LaunchAgent runs).
-fn resolve_run_config(args: RunArgs) -> Result<(WorkerConfig, Option<PathBuf>)> {
-    let config_path = args.config.clone();
-    // Start from the config file if given, else an all-flags base.
-    let mut cfg = match &args.config {
-        Some(path) => {
-            let text = std::fs::read_to_string(path)
-                .with_context(|| format!("reading config {}", path.display()))?;
-            serde_json::from_str::<WorkerConfig>(&text)
-                .with_context(|| format!("parsing config {}", path.display()))?
-        }
-        None => WorkerConfig {
-            server: args
-                .server
-                .clone()
-                .context("--server is required when --config is not given")?,
-            node: args
-                .node
-                .clone()
-                .context("--node is required when --config is not given")?,
-            token: Some(
-                args.token
-                    .clone()
-                    .context("--token is required when --config is not given")?,
-            ),
-            credential: None,
-            cpu: args
-                .cpu
-                .context("--cpu is required when --config is not given")?,
-            memory: args
-                .memory
-                .context("--memory is required when --config is not given")?,
-            reconcile_secs: 5,
-            heartbeat_secs: 10,
-            lease_secs: 40,
-        },
-    };
-    // Explicit flags override whatever the file provided.
-    if let Some(v) = args.server {
-        cfg.server = v;
-    }
-    if let Some(v) = args.node {
-        cfg.node = v;
-    }
-    if let Some(v) = args.token {
-        // An explicit --token means "join again": drop any credential we hold,
-        // otherwise the token would be silently ignored in favour of it.
-        cfg.token = Some(v);
-        cfg.credential = None;
-    }
-    if let Some(v) = args.cpu {
-        cfg.cpu = v;
-    }
-    if let Some(v) = args.memory {
-        cfg.memory = v;
-    }
-    if let Some(v) = args.reconcile_secs {
-        cfg.reconcile_secs = v;
-    }
-    if let Some(v) = args.heartbeat_secs {
-        cfg.heartbeat_secs = v;
-    }
-    if let Some(v) = args.lease_secs {
-        cfg.lease_secs = v;
-    }
-    Ok((cfg, config_path))
-}
+/// Join a control plane and persist the resulting config.
+///
+/// Nothing is written until the credential is in hand: a config file that exists
+/// but holds no credential would be a half-joined state that `run` would have to
+/// interpret, so failure here leaves the machine exactly as it was.
+async fn setup(args: SetupArgs) -> Result<()> {
+    let path = args.path.resolve()?;
 
-async fn run(mut cfg: WorkerConfig, config_path: Option<PathBuf>) -> Result<()> {
-    // Fail closed: never advertise more than the machine physically has.
+    // Reject impossible capacity before touching the network (Principle #6).
     let host = detect_host()?;
-    validate_capacity(cfg.cpu, cfg.memory, host)?;
+    validate_capacity(args.cpu, args.memory, host)?;
+
+    let cfg = WorkerConfig {
+        server: args.server,
+        node: args.node,
+        credential: None,
+        cpu: args.cpu,
+        memory: args.memory,
+        reconcile_secs: args.reconcile_secs,
+        heartbeat_secs: args.heartbeat_secs,
+        lease_secs: args.lease_secs,
+    };
 
     let runtime = AppleContainer::new();
     let runtime_version = runtime
@@ -231,14 +215,30 @@ async fn run(mut cfg: WorkerConfig, config_path: Option<PathBuf>) -> Result<()> 
         .await
         .unwrap_or_else(|_| "unknown".to_string());
 
-    // Register to publish what this machine offers. The first start presents
-    // the one-shot join token and gets a credential back; every later start
-    // presents that credential, so an expired join token can never strand a
-    // worker that has already joined.
-    let bearer = cfg.bearer()?;
-    let registrar = ApiClient::new(&cfg.server, Some(bearer.expose().to_string()));
+    let join = Bearer::Join(args.token);
+    let client = ApiClient::new(&cfg.server, Some(join.expose().to_string()));
+    let response = client
+        .register(&registration(&cfg, &runtime_version))
+        .await
+        .with_context(|| format!("registering {} with {}", cfg.node, cfg.server))?;
+
+    let credential = daemon::credential_from_response(&response)?;
+    let joined = cfg.with_credential(credential);
+    config::save(&path, &joined)?;
+
+    println!("joined {} as {}", joined.server, joined.node);
+    println!("  config:  {}", path.display());
+    println!("  advertising {} cpu, {} memory", joined.cpu, joined.memory);
+    println!(
+        "\nNext: `veloslet run` to run in this terminal, or `veloslet run -d` for the background worker."
+    );
+    Ok(())
+}
+
+/// The registration body a worker publishes about itself.
+fn registration(cfg: &WorkerConfig, runtime_version: &str) -> serde_json::Value {
     let sys = detect_system_info();
-    let request = serde_json::json!({
+    serde_json::json!({
         "name": cfg.node,
         "capacity": { "cpu": cfg.cpu, "memoryBytes": cfg.memory.bytes() },
         "addresses": [],
@@ -249,49 +249,88 @@ async fn run(mut cfg: WorkerConfig, config_path: Option<PathBuf>) -> Result<()> 
             "arch": sys.arch,
             "hostname": sys.hostname,
         },
-    });
-    // Retry registration in-process instead of exiting on failure. This keeps a
-    // long-lived process alive so macOS can attribute (and the user can approve)
-    // the Local Network privacy prompt — a process that exits immediately on the
-    // first blocked connection tears the prompt's owner down before it can be
-    // approved. It also rides out transient server outages.
-    let resp = loop {
-        match registrar.register(&request).await {
-            Ok(resp) => break resp,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// config
+// ---------------------------------------------------------------------------
+
+fn config_command(command: ConfigCommand) -> Result<()> {
+    match command {
+        ConfigCommand::Path(path) => {
+            println!("{}", path.resolve()?.display());
+            Ok(())
+        }
+        ConfigCommand::Show(path) => {
+            let cfg = config::load(&path.resolve()?)?;
+            println!("{}", config::redacted_json(&cfg)?);
+            Ok(())
+        }
+        ConfigCommand::Get { field, path } => {
+            let cfg = config::load(&path.resolve()?)?;
+            println!("{}", field.read(&cfg));
+            Ok(())
+        }
+        ConfigCommand::Set { edits, path } => {
+            if edits.is_empty() {
+                bail!("nothing to set — pass at least one field, e.g. `--cpu 8` (see --help)");
+            }
+            let file = path.resolve()?;
+            let cfg = config::load(&file)?;
+            let changed = edits.touched().join(", ");
+            let updated = edits.apply(&cfg)?;
+            // Capacity is validated here as well as at startup, so an impossible
+            // value is refused while the user is still looking at the terminal
+            // rather than at the next restart.
+            validate_capacity(updated.cpu, updated.memory, detect_host()?)?;
+            config::save(&file, &updated)?;
+            println!("set {changed} in {}", file.display());
+            Ok(())
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// run
+// ---------------------------------------------------------------------------
+
+async fn run(path: PathBuf) -> Result<()> {
+    let cfg = config::load(&path)?;
+
+    // Fail closed: never advertise more than the machine physically has.
+    let host = detect_host()?;
+    validate_capacity(cfg.cpu, cfg.memory, host)?;
+
+    // A worker only ever speaks as itself. `setup` is the one place a credential
+    // is minted, so an unjoined config stops here with a message that says so.
+    let bearer = cfg.bearer()?;
+
+    let runtime = AppleContainer::new();
+    let runtime_version = runtime
+        .version()
+        .await
+        .unwrap_or_else(|_| "unknown".to_string());
+
+    // Re-register on every start to refresh what this worker advertises, and
+    // retry in-process rather than exiting. A long-lived process is what lets
+    // macOS attribute (and the user approve) the Local Network privacy prompt —
+    // one that exits on the first blocked connection tears the prompt's owner
+    // down before it can be approved. It also rides out transient outages.
+    let client = ApiClient::new(&cfg.server, Some(bearer.expose().to_string()));
+    let request = registration(&cfg, &runtime_version);
+    loop {
+        match client.register(&request).await {
+            Ok(_) => break,
             Err(e) => {
                 tracing::warn!("register failed, retrying in 10s: {e}");
                 tokio::time::sleep(Duration::from_secs(10)).await;
             }
         }
-    };
-    // A join hands back a credential: persist it and erase the join token, in
-    // one write, before doing anything else with it.
-    if let Some(joined) = cfg.adopt(&bearer, &resp)? {
-        match &config_path {
-            Some(path) => {
-                let json = serde_json::to_string_pretty(&joined).context("serializing config")?;
-                write_file(path, &json, 0o600)?;
-                tracing::info!("joined as {}; join token consumed", cfg.node);
-            }
-            None => tracing::warn!(
-                "joined as {}, but no --config to persist the credential in — \
-                 this worker will need its join token again on the next start",
-                cfg.node
-            ),
-        }
-        cfg = joined;
-    } else {
-        tracing::info!("re-registered worker {} with its credential", cfg.node);
     }
+    tracing::info!("registered worker {} with its credential", cfg.node);
 
-    // From here on the worker only ever speaks as itself: a join token is not
-    // a credential and the API will not accept one.
-    let Bearer::Credential(credential) = cfg.bearer()? else {
-        bail!("registration did not yield a worker credential");
-    };
-    let client = ApiClient::new(&cfg.server, Some(credential));
     let runtime: Arc<dyn ContainerRuntime> = Arc::new(runtime);
-
     tracing::info!("veloslet {} reconciling against {}", cfg.node, cfg.server);
     run_loop(
         client,
@@ -306,7 +345,7 @@ async fn run(mut cfg: WorkerConfig, config_path: Option<PathBuf>) -> Result<()> 
 }
 
 // ---------------------------------------------------------------------------
-// install / uninstall (side effects)
+// run -d / stop / uninstall (side effects)
 // ---------------------------------------------------------------------------
 
 fn write_file(path: &Path, contents: &str, mode: u32) -> Result<()> {
@@ -318,6 +357,21 @@ fn write_file(path: &Path, contents: &str, mode: u32) -> Result<()> {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
         .with_context(|| format!("chmod {mode:o} {}", path.display()))?;
     Ok(())
+}
+
+/// The background worker is a launchd LaunchAgent, so `run -d`, `stop` and
+/// `uninstall` only mean anything on macOS. Say so once, here, rather than
+/// letting the caller discover it as a missing `codesign` or `launchctl`
+/// several side effects deep — `install.sh` installs `veloslet` on Linux too.
+fn require_macos(command: &str) -> Result<()> {
+    if cfg!(target_os = "macos") {
+        return Ok(());
+    }
+    bail!(
+        "`veloslet {command}` manages a macOS launchd LaunchAgent and does nothing on this \
+         platform — run the worker with `veloslet run` under your own service manager \
+         (systemd, supervisord, …) instead"
+    )
 }
 
 /// Run `launchctl` quietly — we report success/failure ourselves, so suppress
@@ -332,13 +386,24 @@ fn launchctl(args: &[&str]) -> Result<bool> {
     Ok(status.success())
 }
 
-fn install(args: InstallArgs) -> Result<()> {
-    let paths = Paths::resolve()?;
+/// `run -d`: install the worker as a launchd LaunchAgent and start it.
+///
+/// This only ever *starts* an already-joined worker. The credential comes from
+/// the config `setup` wrote, so a machine that has not joined is told to do that
+/// first instead of ending up with a background process that cannot authenticate.
+fn run_daemon(config_file: PathBuf) -> Result<()> {
+    require_macos("run -d")?;
+    let paths = Paths::resolve(config_file)?;
     let version = env!("CARGO_PKG_VERSION");
 
-    // Reject impossible capacity before touching the filesystem or launchd.
-    let host = detect_host()?;
-    validate_capacity(args.cpu, args.memory, host)?;
+    let cfg = config::load(&paths.config_file)?;
+    if !cfg.is_connected() {
+        bail!(
+            "the config at {} has no credential — run `veloslet setup` first",
+            paths.config_file.display()
+        );
+    }
+    validate_capacity(cfg.cpu, cfg.memory, detect_host()?)?;
 
     // 1. App bundle: copy this running binary into Velos.app and give it a
     //    bundle identity so Local Network privacy can attribute its traffic.
@@ -366,7 +431,7 @@ fn install(args: InstallArgs) -> Result<()> {
     //    would re-pin the grant to the cdhash and break it on every rebuild.
     let identity = signing::ensure_identity(&paths.codesign_dir)?;
     signing::sign_bundle(&paths.bundle_dir, BUNDLE_ID, identity)?;
-    // Verify with the system codesign so a bad signature fails install loudly.
+    // Verify with the system codesign so a bad signature fails loudly.
     let bundle = path_str(&paths.bundle_dir)?;
     let verified = Process::new("codesign")
         .args(["--verify", "--strict", bundle])
@@ -376,23 +441,7 @@ fn install(args: InstallArgs) -> Result<()> {
         bail!("codesign verification failed for {bundle}");
     }
 
-    // 3. Persist config (0600 — it holds the join token, and later the
-    //    credential the worker trades it for).
-    let cfg = WorkerConfig {
-        server: args.server,
-        node: args.node,
-        token: Some(args.token),
-        credential: None,
-        cpu: args.cpu,
-        memory: args.memory,
-        reconcile_secs: args.reconcile_secs,
-        heartbeat_secs: args.heartbeat_secs,
-        lease_secs: args.lease_secs,
-    };
-    let cfg_json = serde_json::to_string_pretty(&cfg).context("serializing config")?;
-    write_file(&paths.config_file, &cfg_json, 0o600)?;
-
-    // 4. LaunchAgent plist pointing at the bundled binary + config.
+    // 3. LaunchAgent plist pointing at the bundled binary + config.
     let program_args = vec![
         path_str(&paths.bundle_bin)?.to_string(),
         "run".to_string(),
@@ -407,7 +456,7 @@ fn install(args: InstallArgs) -> Result<()> {
     );
     write_file(&paths.agent_plist, &agent, 0o644)?;
 
-    // 5. (Re)load the agent.
+    // 4. (Re)load the agent.
     let agent_path = path_str(&paths.agent_plist)?;
     let _ = launchctl(&["unload", agent_path]);
     if !launchctl(&["load", "-w", agent_path])? {
@@ -421,7 +470,7 @@ fn install(args: InstallArgs) -> Result<()> {
         .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_LocalNetwork")
         .status();
 
-    println!("installed and started LaunchAgent {BUNDLE_ID}");
+    println!("started background worker {BUNDLE_ID}");
     println!("  bundle:  {}", paths.bundle_dir.display());
     println!("  config:  {}", paths.config_file.display());
     println!("  agent:   {}", paths.agent_plist.display());
@@ -435,24 +484,36 @@ fn install(args: InstallArgs) -> Result<()> {
     Ok(())
 }
 
-fn uninstall(args: UninstallArgs) -> Result<()> {
-    let paths = Paths::resolve()?;
-    if let Some(agent_path) = paths.agent_plist.to_str() {
-        let _ = launchctl(&["unload", agent_path]);
-    }
+/// `stop`: unload the LaunchAgent, leaving the bundle and config in place so
+/// `run -d` can start it again without re-joining.
+fn stop(config_file: PathBuf) -> Result<()> {
+    require_macos("stop")?;
+    let paths = Paths::resolve(config_file)?;
+    let agent_path = path_str(&paths.agent_plist)?;
+    let _ = launchctl(&["unload", agent_path]);
     remove_if_exists(&paths.agent_plist)?;
-    if args.purge {
-        remove_dir_if_exists(&paths.bundle_dir)?;
-        remove_if_exists(&paths.config_file)?;
-        println!("uninstalled LaunchAgent {BUNDLE_ID} and purged bundle + config");
-    } else {
-        println!(
-            "uninstalled LaunchAgent {BUNDLE_ID} (kept bundle + config; pass --purge to remove)"
-        );
-    }
+    println!("stopped background worker {BUNDLE_ID}");
+    println!("  the app bundle and config are kept — `veloslet run -d` starts it again");
+    Ok(())
+}
+
+/// `uninstall`: take the worker off this machine for good.
+fn uninstall(config_file: PathBuf) -> Result<()> {
+    require_macos("uninstall")?;
+    let paths = Paths::resolve(config_file)?;
+    let agent_path = path_str(&paths.agent_plist)?;
+    let _ = launchctl(&["unload", agent_path]);
+    remove_if_exists(&paths.agent_plist)?;
+    remove_dir_if_exists(&paths.bundle_dir)?;
+    remove_if_exists(&paths.config_file)?;
+    println!("uninstalled {BUNDLE_ID}: LaunchAgent, app bundle, and config removed");
     println!(
-        "Note: the Local Network privacy grant for {} remains in\n\
-         System Settings → Privacy & Security → Local Network; remove it there if desired.",
+        "  the worker credential is gone with the config — rejoining needs a new\n  \
+         join token and `veloslet setup`"
+    );
+    println!(
+        "  the Local Network privacy grant for {} remains in System Settings →\n  \
+         Privacy & Security → Local Network; remove it there if desired.",
         daemon::BUNDLE_DISPLAY_NAME
     );
     Ok(())
@@ -478,11 +539,17 @@ fn remove_dir_if_exists(path: &Path) -> Result<()> {
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
     match Cli::parse().command {
+        Command::Setup(args) => setup(args).await,
+        Command::Config { command } => config_command(command),
         Command::Run(args) => {
-            let (cfg, config_path) = resolve_run_config(args)?;
-            run(cfg, config_path).await
+            let path = args.path.resolve()?;
+            if args.daemon {
+                run_daemon(path)
+            } else {
+                run(path).await
+            }
         }
-        Command::Install(args) => install(args),
-        Command::Uninstall(args) => uninstall(args),
+        Command::Stop(path) => stop(path.resolve()?),
+        Command::Uninstall(path) => uninstall(path.resolve()?),
     }
 }
