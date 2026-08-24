@@ -1,4 +1,4 @@
-.PHONY: build web test fmt clippy check run install-ctl install-let
+.PHONY: build web test test-install fmt clippy check run install-ctl install-let
 
 # Build the web UI into crates/server/ui (embedded by the server) and then
 # the whole workspace. Run `make web` alone to rebuild just the dashboard.
@@ -11,6 +11,10 @@ web:
 test:
 	cargo test --workspace
 
+# End-to-end test of install.sh against a fake release served over localhost.
+test-install:
+	sh scripts/test-install.sh
+
 fmt:
 	cargo fmt --all
 
@@ -21,6 +25,7 @@ check:
 	cargo fmt --all --check
 	cargo clippy --all-targets --all-features -- -D warnings
 	cargo test --workspace
+	sh scripts/test-install.sh
 
 run:
 	cargo run -p velos-server

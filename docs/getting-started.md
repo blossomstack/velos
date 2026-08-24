@@ -22,6 +22,7 @@ containers, and understand what happens under the hood.
 
 | Requirement | Needed for |
 |---|---|
+| **curl** + **tar** | Installing the prebuilt binaries with the install script (§2). |
 | **Rust** (stable) | Building from source. Pinned by `rust-toolchain.toml`. |
 | **Node.js 18+** + npm | Building the dashboard from source (not needed if you `cargo install`). |
 | **Apple `container` CLI** | Running a **worker** — this is the current container runtime backend. The control plane, CLI, and dashboard don't need it. |
@@ -36,6 +37,33 @@ container --version
 ```
 
 ## 2. Install
+
+### Via the install script (prebuilt binaries)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/blossomstack/velos/main/install.sh | sh
+```
+
+This picks the release build for your platform (macOS or Linux, arm64 or x86_64),
+verifies it against its published SHA-256, and installs `velosctl` into
+`~/.local/bin`. It prints an `export PATH=…` line if that directory isn't on your
+`PATH` yet. To pass options through the pipe, add `-s --`:
+
+```bash
+# control plane + CLI + worker agent, installed system-wide
+curl -fsSL https://raw.githubusercontent.com/blossomstack/velos/main/install.sh \
+  | sh -s -- --components all --bin-dir /usr/local/bin
+```
+
+| Option | Env | Default | Meaning |
+|---|---|---|---|
+| `--components` | `VELOS_COMPONENTS` | `velosctl` | comma-separated `velosctl`, `veloslet`, `velos-server`, or `all` |
+| `--bin-dir` | `VELOS_BIN_DIR` | `~/.local/bin` | where to install |
+| `--version` | `VELOS_VERSION` | latest release | release tag, e.g. `v0.1.3` |
+
+The script fails closed: an unsupported platform, a missing or mismatched
+checksum, or a binary that won't run here all abort the install instead of
+leaving something broken on your `PATH`. Re-running it upgrades in place.
 
 ### Via cargo
 
@@ -130,6 +158,42 @@ Resolution precedence, highest first:
 |---|---|
 | token | `--token` flag → `VELOS_TOKEN` env → `~/.velos/config` |
 | server | `--server` flag → `VELOS_SERVER` env → `~/.velos/config` → `http://127.0.0.1:8080` |
+
+### Check your setup with `velosctl doctor`
+
+```bash
+velosctl doctor
+```
+
+It reports, in order: the `velosctl` version and where it is installed; the config
+file and its permissions; the server URL **and which layer supplied it**; whether a
+credential is present; whether the server answers, is initialized, and accepts that
+credential; how many workers are Ready; and whether this machine has the `container`
+runtime. Every line that isn't a pass carries the command that fixes it.
+
+Run against a server that is up but not set up yet, it looks like this:
+
+```
+  ✔ velosctl     v0.1.3 (/Users/you/.local/bin/velosctl)
+  ! config file  /Users/you/.velos/config not written yet
+                   → run `velosctl login --token <token> --server <url>` to save one
+  ✔ server url   http://127.0.0.1:8080 (from built-in default)
+  ✗ credential   none — every API call will be rejected
+                   → run `velosctl login --token <token> --server <url>`
+  ✔ reachable    http://127.0.0.1:8080 answered /healthz
+  ✗ initialized  no admin account — the server rejects everything until first-run setup
+                   → open http://127.0.0.1:8080 and create the admin account
+  - identity     no credential to check
+  - api access   no credential to check
+  ✔ runtime      container CLI version 1.0.0
+
+2 failed, 1 warning — see the hints above
+```
+
+A `-` means the check was skipped because an earlier one made it meaningless — a
+server that isn't answering can't tell you whether your token is good. `doctor`
+exits non-zero when something failed (warnings alone still exit 0), so a setup
+script can gate on it. It only reads; nothing it does changes state.
 
 > Prefer the CLI without a browser? You can drive setup over HTTP directly:
 > `curl -X POST :8080/auth/v1/setup -d '{"username":"admin","password":"…"}'`,
@@ -241,6 +305,9 @@ velosctl resume my-job
 
 # Delete
 velosctl delete container my-job
+
+# Diagnose the setup: config, server, credential, workers, runtime
+velosctl doctor
 ```
 
 > **Why `status.phase: "Pending"`:** the scheduler only places containers whose
@@ -346,6 +413,9 @@ Auth endpoints at a glance:
 > any endpoint. Single-admin and the two-tier model are the current scope.
 
 ## 10. Troubleshooting
+
+Start with **`velosctl doctor`** (§4) — it names the broken layer and the command
+that fixes it. The table below covers the rest.
 
 | Symptom | Likely cause / fix |
 |---|---|

@@ -35,7 +35,8 @@ direction.
 - **`veloslet`** — the per-worker agent. Registers its machine, renews a lease to
   prove liveness, and reconciles its assigned containers against the runtime.
 - **`velosctl`** — a command-line client for the API. `velosctl login` saves an
-  admin token (and server URL) to `~/.velos/config` for subsequent calls.
+  admin token (and server URL) to `~/.velos/config` for subsequent calls, and
+  `velosctl doctor` diagnoses a setup that isn't working.
 - **Web dashboard** — a React UI for first-run admin setup, watching workers and
   containers, launching workloads, and managing CLI tokens, served directly by the
   server.
@@ -105,13 +106,22 @@ bound, the placement is recorded in `status.workerName` and never re-evaluated.
 
 ## Getting started
 
-Install with cargo:
+Install the CLI:
 
 ```bash
-cargo install velos-server velosctl veloslet
+curl -fsSL https://raw.githubusercontent.com/blossomstack/velos/main/install.sh | sh
 ```
 
-…or build from source with `make build` (which also builds the embedded dashboard).
+That downloads the latest release for your platform, checks it against its published
+SHA-256, and installs `velosctl` into `~/.local/bin`. Useful flags: `--components all`
+(also install `velos-server` and `veloslet`), `--bin-dir /usr/local/bin`,
+`--version v0.1.3`. Prefer cargo? `cargo install velos-server velosctl veloslet`.
+Or build from source with `make build` (which also builds the embedded dashboard).
+
+At any point, **`velosctl doctor`** checks your setup — config file, server URL,
+credential, whether the control plane is reachable and initialized, how many
+workers are Ready, and whether this machine has a container runtime — and prints
+what to fix.
 
 Then follow **[docs/getting-started.md](docs/getting-started.md)** for the full
 walkthrough: start the control plane, set up the admin account and connect
@@ -127,7 +137,8 @@ dashboard do not.)
 make build        # build the web UI + workspace
 make web          # rebuild just the web UI (embedded by the server)
 make test         # cargo test --workspace
-make check        # fmt --check + clippy -D warnings + test  (pre-PR gate)
+make test-install # end-to-end test of install.sh
+make check        # fmt + clippy + test + install.sh test  (pre-PR gate)
 make run          # run the server
 make install-ctl  # install velosctl into ~/.cargo/bin
 make install-let  # install veloslet into ~/.cargo/bin

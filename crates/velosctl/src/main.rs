@@ -51,6 +51,9 @@ enum Command {
     },
     /// Remove the saved credential.
     Logout,
+    /// Check the local setup and the configured control plane, and report what
+    /// to fix. Exits non-zero if anything is broken.
+    Doctor,
 }
 
 #[derive(Subcommand, Debug)]
@@ -62,7 +65,7 @@ enum TokenCommand {
     },
 }
 
-fn client(token: &Option<String>, rb: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+fn client(token: Option<&str>, rb: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
     match token {
         Some(t) => rb.bearer_auth(t),
         None => rb,
@@ -93,16 +96,17 @@ async fn main() -> Result<()> {
 
     // Resolve server + token: flag > env > saved config (server also > default).
     let cfg = velosctl::load_config();
-    let server = velosctl::resolve_server(
+    let (server, server_source) = velosctl::resolve_server(
         cli.server.as_deref(),
         std::env::var("VELOS_SERVER").ok().as_deref(),
         &cfg,
     );
-    let token = velosctl::resolve_token(
+    let credential = velosctl::resolve_token(
         cli.token.as_deref(),
         std::env::var("VELOS_TOKEN").ok().as_deref(),
         &cfg,
     );
+    let token = credential.as_ref().map(|(t, _)| t.as_str());
 
     match cli.command {
         Command::Get {
@@ -115,12 +119,12 @@ async fn main() -> Result<()> {
                 Some(n) => object_url(&server, plural, n),
                 None => collection_url(&server, plural, selector.as_deref()),
             };
-            let resp = client(&token, http.get(url)).send().await?;
+            let resp = client(token, http.get(url)).send().await?;
             print_json(&body_or_error(resp).await?)?;
         }
         Command::Delete { kind, name } => {
             let plural = plural_for(&kind).with_context(|| format!("unknown kind: {kind}"))?;
-            let resp = client(&token, http.delete(object_url(&server, plural, &name)))
+            let resp = client(token, http.delete(object_url(&server, plural, &name)))
                 .send()
                 .await?;
             let status = resp.status();
@@ -144,7 +148,7 @@ async fn main() -> Result<()> {
             let contents =
                 std::fs::read_to_string(&file).with_context(|| format!("reading {file}"))?;
             let body: Value = serde_json::from_str(&contents).context("parsing JSON file")?;
-            let resp = client(&token, http.post(collection_url(&server, plural, None)))
+            let resp = client(token, http.post(collection_url(&server, plural, None)))
                 .json(&body)
                 .send()
                 .await?;
@@ -152,7 +156,7 @@ async fn main() -> Result<()> {
         }
         Command::Token(TokenCommand::Create { ttl }) => {
             let url = format!("{}/auth/v1/tokens", server.trim_end_matches('/'));
-            let resp = client(&token, http.post(url))
+            let resp = client(token, http.post(url))
                 .json(&serde_json::json!({ "ttlSeconds": ttl }))
                 .send()
                 .await?;
@@ -175,6 +179,21 @@ async fn main() -> Result<()> {
         Command::Logout => {
             velosctl::save_config(&velosctl::Config::default())?;
             println!("logged out");
+        }
+        Command::Doctor => {
+            let env = velosctl::doctor::Environment {
+                server: &server,
+                server_source,
+                token: credential.as_ref().map(|(t, source)| (t.as_str(), *source)),
+            };
+            let report = velosctl::doctor::diagnose(&env).await;
+            println!("velosctl doctor\n");
+            print!("{report}");
+            if report.has_failures() {
+                // A non-zero exit lets a script gate on a healthy setup; the
+                // report above already said what is wrong.
+                std::process::exit(1);
+            }
         }
     }
     Ok(())

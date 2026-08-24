@@ -1,12 +1,41 @@
 //! `velosctl` REST helpers (the kubectl analog). The pure URL/kind helpers live
 //! here so they can be unit-tested; the binary in `main.rs` wires them to reqwest.
 
+use std::fmt;
 use std::fs;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+pub mod doctor;
+
 pub const DEFAULT_SERVER: &str = "http://127.0.0.1:8080";
+
+/// Which layer supplied a resolved setting. Reported by `doctor` so a
+/// surprising server URL or credential is traceable to where it came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Source {
+    /// A command-line flag.
+    Flag,
+    /// A `VELOS_*` environment variable.
+    Env,
+    /// The saved `~/.velos/config`.
+    Config,
+    /// The built-in fallback.
+    Default,
+}
+
+impl fmt::Display for Source {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let name = match self {
+            Source::Flag => "command line",
+            Source::Env => "environment",
+            Source::Config => "saved config",
+            Source::Default => "built-in default",
+        };
+        f.write_str(name)
+    }
+}
 
 /// Persisted velosctl credentials (`~/.velos/config`), written by `login`.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -17,19 +46,25 @@ pub struct Config {
     pub token: Option<String>,
 }
 
-/// Resolve the server URL: flag > env > config > built-in default.
-pub fn resolve_server(flag: Option<&str>, env: Option<&str>, cfg: &Config) -> String {
-    flag.map(str::to_string)
-        .or_else(|| env.map(str::to_string))
-        .or_else(|| cfg.server.clone())
-        .unwrap_or_else(|| DEFAULT_SERVER.to_string())
+/// Resolve the server URL: flag > env > config > built-in default, with the
+/// layer that supplied it.
+pub fn resolve_server(flag: Option<&str>, env: Option<&str>, cfg: &Config) -> (String, Source) {
+    flag.map(|v| (v.to_string(), Source::Flag))
+        .or_else(|| env.map(|v| (v.to_string(), Source::Env)))
+        .or_else(|| cfg.server.clone().map(|v| (v, Source::Config)))
+        .unwrap_or_else(|| (DEFAULT_SERVER.to_string(), Source::Default))
 }
 
-/// Resolve the bearer token: flag > env > config.
-pub fn resolve_token(flag: Option<&str>, env: Option<&str>, cfg: &Config) -> Option<String> {
-    flag.map(str::to_string)
-        .or_else(|| env.map(str::to_string))
-        .or_else(|| cfg.token.clone())
+/// Resolve the bearer token: flag > env > config, with the layer that supplied
+/// it. There is no default — an absent credential is `None`.
+pub fn resolve_token(
+    flag: Option<&str>,
+    env: Option<&str>,
+    cfg: &Config,
+) -> Option<(String, Source)> {
+    flag.map(|v| (v.to_string(), Source::Flag))
+        .or_else(|| env.map(|v| (v.to_string(), Source::Env)))
+        .or_else(|| cfg.token.clone().map(|v| (v, Source::Config)))
 }
 
 /// `~/.velos/config`, if a home directory is known.
@@ -127,16 +162,19 @@ mod tests {
         };
         assert_eq!(
             resolve_server(Some("http://flag:1"), Some("http://env:1"), &cfg),
-            "http://flag:1"
+            ("http://flag:1".to_string(), Source::Flag)
         );
         assert_eq!(
             resolve_server(None, Some("http://env:1"), &cfg),
-            "http://env:1"
+            ("http://env:1".to_string(), Source::Env)
         );
-        assert_eq!(resolve_server(None, None, &cfg), "http://cfg:1");
+        assert_eq!(
+            resolve_server(None, None, &cfg),
+            ("http://cfg:1".to_string(), Source::Config)
+        );
         assert_eq!(
             resolve_server(None, None, &Config::default()),
-            DEFAULT_SERVER
+            (DEFAULT_SERVER.to_string(), Source::Default)
         );
     }
 
@@ -147,14 +185,17 @@ mod tests {
             token: Some("cfgtok".into()),
         };
         assert_eq!(
-            resolve_token(Some("flagtok"), Some("envtok"), &cfg).as_deref(),
-            Some("flagtok")
+            resolve_token(Some("flagtok"), Some("envtok"), &cfg),
+            Some(("flagtok".to_string(), Source::Flag))
         );
         assert_eq!(
-            resolve_token(None, Some("envtok"), &cfg).as_deref(),
-            Some("envtok")
+            resolve_token(None, Some("envtok"), &cfg),
+            Some(("envtok".to_string(), Source::Env))
         );
-        assert_eq!(resolve_token(None, None, &cfg).as_deref(), Some("cfgtok"));
+        assert_eq!(
+            resolve_token(None, None, &cfg),
+            Some(("cfgtok".to_string(), Source::Config))
+        );
         assert_eq!(resolve_token(None, None, &Config::default()), None);
     }
 

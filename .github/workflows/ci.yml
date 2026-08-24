@@ -57,3 +57,23 @@ jobs:
 
       - name: Build
         run: npm run build
+
+  installer:
+    name: install.sh (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v7
+
+      # shellcheck is preinstalled on the Ubuntu image only.
+      - name: Shellcheck
+        if: matrix.runner == 'ubuntu-latest'
+        run: shellcheck install.sh scripts/test-install.sh
+
+      # Installs a fake release served over localhost, so the whole script runs
+      # here — platform detection, checksum verification, and the rejections.
+      - name: End-to-end install test
+        run: sh scripts/test-install.sh

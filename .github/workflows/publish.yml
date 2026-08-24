@@ -126,6 +126,18 @@ jobs:
           # clobber each other).
           cp "$bindir/velosctl" "velosctl-${GITHUB_REF_NAME}-${{ matrix.target }}"
           cp "$bindir/veloslet" "veloslet-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          # A checksum beside every asset — install.sh refuses to install
+          # anything it cannot verify. One file per asset rather than a single
+          # SHA256SUMS, so the four matrix jobs never race on the same upload.
+          for asset in "velos-${GITHUB_REF_NAME}-${{ matrix.target }}.tar.gz" \
+                       "velosctl-${GITHUB_REF_NAME}-${{ matrix.target }}" \
+                       "veloslet-${GITHUB_REF_NAME}-${{ matrix.target }}"; do
+            if command -v sha256sum >/dev/null 2>&1; then
+              sha256sum "$asset" > "$asset.sha256"
+            else
+              shasum -a 256 "$asset" > "$asset.sha256"
+            fi
+          done
 
       - name: Upload to GitHub release
         env:
@@ -135,6 +147,9 @@ jobs:
           gh release create "$GITHUB_REF_NAME" --verify-tag --title "$GITHUB_REF_NAME" --generate-notes 2>/dev/null || true
           gh release upload "$GITHUB_REF_NAME" \
             "velos-${GITHUB_REF_NAME}-${{ matrix.target }}.tar.gz" \
+            "velos-${GITHUB_REF_NAME}-${{ matrix.target }}.tar.gz.sha256" \
             "velosctl-${GITHUB_REF_NAME}-${{ matrix.target }}" \
+            "velosctl-${GITHUB_REF_NAME}-${{ matrix.target }}.sha256" \
             "veloslet-${GITHUB_REF_NAME}-${{ matrix.target }}" \
+            "veloslet-${GITHUB_REF_NAME}-${{ matrix.target }}.sha256" \
             --clobber
