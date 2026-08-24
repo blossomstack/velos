@@ -14,7 +14,9 @@ server_pid=""
 port=""
 
 cleanup() {
-    [ -n "$server_pid" ] && kill "$server_pid" 2>/dev/null || true
+    if [ -n "$server_pid" ]; then
+        kill "$server_pid" 2>/dev/null || true
+    fi
     rm -rf "$work"
 }
 trap cleanup EXIT INT TERM
@@ -53,16 +55,28 @@ fi
 
 # --- serve it -------------------------------------------------------------
 
+command -v python3 >/dev/null 2>&1 || fail "python3 is required to serve the fake release"
+
 # Port 0 lets the OS pick a free port; python prints the bound one.
-# -u keeps the "Serving HTTP on ... port N" line unbuffered so we can read the port.
+# -u keeps the "Serving HTTP on ... port N" line unbuffered so we can read it.
 python3 -u -m http.server 0 --bind 127.0.0.1 --directory "$work/assets" >"$work/http.log" 2>&1 &
 server_pid=$!
-for _ in 1 2 3 4 5 6 7 8 9 10; do
+# Up to 30s: a cold CI runner can take seconds just to start the interpreter.
+attempt=0
+while [ "$attempt" -lt 60 ]; do
     port="$(sed -n 's/.*127\.0\.0\.1 port \([0-9]*\).*/\1/p' "$work/http.log" | head -1)"
-    [ -n "$port" ] && break
-    sleep 0.3
+    if [ -n "$port" ]; then
+        break
+    fi
+    if ! kill -0 "$server_pid" 2>/dev/null; then
+        fail "test http server exited: $(cat "$work/http.log")"
+    fi
+    attempt=$((attempt + 1))
+    sleep 0.5
 done
-[ -n "$port" ] || fail "test http server did not start: $(cat "$work/http.log")"
+if [ -z "$port" ]; then
+    fail "test http server did not print its port in 30s: $(cat "$work/http.log")"
+fi
 base="http://127.0.0.1:$port"
 
 # --- the happy path -------------------------------------------------------
@@ -74,8 +88,12 @@ VELOS_DOWNLOAD_BASE="$base" sh "$root/install.sh" \
 
 [ -x "$bin/velosctl" ] || fail "velosctl was not installed"
 [ -x "$bin/veloslet" ] || fail "veloslet was not installed"
-[ -e "$bin/velos-server" ] && fail "velos-server was installed but not requested"
-ls "$bin"/.*.new >/dev/null 2>&1 && fail "a staging file was left behind in $bin"
+if [ -e "$bin/velos-server" ]; then
+    fail "velos-server was installed but not requested"
+fi
+if ls "$bin"/.*.new >/dev/null 2>&1; then
+    fail "a staging file was left behind in $bin"
+fi
 pass "installs the requested components"
 
 grep -q "not on your PATH" "$work/out.log" || fail "no PATH hint for a bin dir outside PATH"
@@ -90,7 +108,9 @@ if VELOS_DOWNLOAD_BASE="$base" sh "$root/install.sh" \
     fail "install accepted a tarball that does not match its checksum"
 fi
 grep -q "checksum mismatch" "$work/bad.log" || fail "wrong error for a checksum mismatch: $(cat "$work/bad.log")"
-[ -e "$bad/velosctl" ] && fail "a binary was installed despite the checksum mismatch"
+if [ -e "$bad/velosctl" ]; then
+    fail "a binary was installed despite the checksum mismatch"
+fi
 pass "rejects a tarball that does not match its checksum"
 
 # --- a missing checksum must be rejected ----------------------------------
