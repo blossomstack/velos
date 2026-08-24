@@ -15,9 +15,19 @@ enum ContainerPhase {
     Pending,
     Scheduled,
     Running,
+    Hibernated,
     Succeeded,
     Failed,
     Unknown,
+}
+
+/// The run state the user wants for a container. `spec.desiredState` is the
+/// *intent*; `status.phase` is what the worker observes. Hibernating shuts the
+/// micro-VM down while keeping the instance (and its disk) so it can be
+/// started again — it is not a delete.
+enum DesiredState {
+    Running,
+    Hibernated,
 }
 
 enum RestartPolicy {
@@ -76,6 +86,7 @@ struct ContainerSpec {
     env: Map<String, String>,
     resources: ResourceReqs,
     restart_policy: RestartPolicy,
+    desired_state: DesiredState,
     node_name: Option<String>,
     node_selector: Map<String, String>,
     affinity: Option<NodeAffinity>,
@@ -87,6 +98,7 @@ struct ContainerStatus {
     worker_name: Option<String>,
     container_id: Option<String>,
     started_at: Option<DateTimeUtc>,
+    hibernated_at: Option<DateTimeUtc>,
     finished_at: Option<DateTimeUtc>,
     exit_code: Option<i32>,
     message: Option<String>,

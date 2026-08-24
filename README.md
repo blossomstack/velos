@@ -46,10 +46,31 @@ Velos manages three object types, each with `metadata` / `spec` / `status`, serv
 under `/api/v1/{plural}`:
 
 - **Container** — a workload. Its phase moves `Pending → Scheduled → Running →
-  Succeeded | Failed`, or `Unknown` when its node's state is lost.
+  Succeeded | Failed`, or `Unknown` when its node's state is lost. It can also be
+  parked in `Hibernated` — see [Hibernation](#hibernation).
 - **Worker** — a registered machine, with its capacity and a `Ready` condition.
 - **Lease** — a worker's periodic heartbeat; a stale lease marks its worker
   `NotReady`.
+
+## Hibernation
+
+A container can be shut down temporarily without being destroyed:
+
+```bash
+velosctl hibernate my-job     # POST /api/v1/containers/my-job/hibernate
+velosctl resume    my-job     # POST /api/v1/containers/my-job/resume
+```
+
+Hibernating stops the micro-VM but keeps everything else: the object, its
+worker binding, its disk, and its share of that worker's capacity — so waking it
+is guaranteed a slot and picks up the same instance rather than a fresh one.
+It is not a delete, and it is not an exit: the `restartPolicy` does not apply to
+a hibernated container.
+
+Both endpoints are declarative and idempotent — they record the intent in
+`spec.desiredState` (`Running` | `Hibernated`), and the owning worker converges
+the micro-VM on its next reconcile pass and reports `status.phase`. A container
+that has already finished (`Succeeded` / `Failed`) cannot be hibernated (`409`).
 
 ## Placement
 

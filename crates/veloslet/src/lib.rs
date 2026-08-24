@@ -18,7 +18,9 @@ use serde_json::Value;
 use velos_runtime::ContainerRuntime;
 
 pub use client::{ApiClient, ClientError};
-pub use reconcile::{Action, DesiredContainer, ObservedInstance, RestartPolicy, reconcile};
+pub use reconcile::{
+    Action, DesiredContainer, DesiredState, ObservedInstance, RestartPolicy, reconcile,
+};
 
 /// The finalizer this worker owns; its presence means "veloslet must clean up
 /// the micro-VM before the server may remove the object".
@@ -68,6 +70,8 @@ fn desired_from_doc(doc: &Value) -> Option<DesiredContainer> {
         .unwrap_or_default();
     let restart_policy =
         RestartPolicy::parse(str_at(doc, &["spec", "restartPolicy"]).unwrap_or("Never"));
+    let desired_state =
+        DesiredState::parse(str_at(doc, &["spec", "desiredState"]).unwrap_or("Running"));
     let phase = str_at(doc, &["status", "phase"])
         .unwrap_or("Pending")
         .to_string();
@@ -88,6 +92,7 @@ fn desired_from_doc(doc: &Value) -> Option<DesiredContainer> {
         command,
         env,
         restart_policy,
+        desired_state,
         phase,
         marked_for_deletion,
         has_finalizer,
@@ -104,6 +109,17 @@ fn running_status(node: &str, instance_id: &str) -> Value {
         "workerName": node,
         "containerID": instance_id,
         "startedAt": chrono::Utc::now().to_rfc3339(),
+    })
+}
+
+/// The status of a container that is asleep. `containerID` is deliberately
+/// dropped: the instance exists but nothing is running in it, and the status
+/// subresource replaces the whole object, so anything not restated is gone.
+fn hibernated_status(node: &str) -> Value {
+    serde_json::json!({
+        "phase": "Hibernated",
+        "workerName": node,
+        "hibernatedAt": chrono::Utc::now().to_rfc3339(),
     })
 }
 
@@ -160,6 +176,21 @@ pub async fn apply_action(
         }
         Action::ReportRunning { name } => {
             client.put_status(&name, running_status(node, "")).await?;
+        }
+        Action::Hibernate { name, uid } => {
+            // `stop`, never `remove`: the instance and its disk must survive so
+            // `Resume` can boot the same micro-VM back up.
+            runtime.stop(&uid).await?;
+            client.put_status(&name, hibernated_status(node)).await?;
+        }
+        Action::Resume { name, uid } => {
+            let id = runtime.start(&uid).await?;
+            client
+                .put_status(&name, running_status(node, &id.0))
+                .await?;
+        }
+        Action::ReportHibernated { name } => {
+            client.put_status(&name, hibernated_status(node)).await?;
         }
         Action::ReportTerminal {
             name,
