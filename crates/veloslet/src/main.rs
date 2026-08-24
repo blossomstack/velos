@@ -7,7 +7,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use velos_runtime::{AppleContainer, ContainerRuntime};
-use veloslet::daemon::{self, BUNDLE_EXECUTABLE, BUNDLE_ID, WorkerConfig};
+use veloslet::daemon::{self, BUNDLE_EXECUTABLE, BUNDLE_ID, Bearer, WorkerConfig};
 use veloslet::host::{detect_host, detect_system_info, validate_capacity};
 use veloslet::memory::Memory;
 use veloslet::{ApiClient, run_loop};
@@ -46,7 +46,8 @@ struct RunArgs {
     /// This worker's name (overrides config).
     #[arg(long)]
     node: Option<String>,
-    /// Bootstrap token (`id.secret`) used to register on first start.
+    /// Join token (`id.secret`). Only needed to join; passing it discards any
+    /// credential already in the config and joins again from scratch.
     #[arg(long)]
     token: Option<String>,
     /// Advertised CPU cores (overrides config).
@@ -74,7 +75,8 @@ struct InstallArgs {
     /// This worker's name.
     #[arg(long)]
     node: String,
-    /// Bootstrap token (`id.secret`), e.g. from `velosctl token create`.
+    /// Join token (`id.secret`), e.g. from `velosctl token create`. Consumed on
+    /// the first successful registration and replaced by a worker credential.
     #[arg(long)]
     token: String,
     /// Advertised CPU cores.
@@ -147,7 +149,12 @@ fn path_str(p: &Path) -> Result<&str> {
 // run
 // ---------------------------------------------------------------------------
 
-fn resolve_run_config(args: RunArgs) -> Result<WorkerConfig> {
+/// Resolve the config to run with, plus the path to write it back to once the
+/// join is consumed. Without `--config` there is nowhere to persist, so the
+/// worker re-joins on every start (a foreground/dev mode, not how the
+/// LaunchAgent runs).
+fn resolve_run_config(args: RunArgs) -> Result<(WorkerConfig, Option<PathBuf>)> {
+    let config_path = args.config.clone();
     // Start from the config file if given, else an all-flags base.
     let mut cfg = match &args.config {
         Some(path) => {
@@ -165,10 +172,12 @@ fn resolve_run_config(args: RunArgs) -> Result<WorkerConfig> {
                 .node
                 .clone()
                 .context("--node is required when --config is not given")?,
-            token: args
-                .token
-                .clone()
-                .context("--token is required when --config is not given")?,
+            token: Some(
+                args.token
+                    .clone()
+                    .context("--token is required when --config is not given")?,
+            ),
+            credential: None,
             cpu: args
                 .cpu
                 .context("--cpu is required when --config is not given")?,
@@ -188,7 +197,10 @@ fn resolve_run_config(args: RunArgs) -> Result<WorkerConfig> {
         cfg.node = v;
     }
     if let Some(v) = args.token {
-        cfg.token = v;
+        // An explicit --token means "join again": drop any credential we hold,
+        // otherwise the token would be silently ignored in favour of it.
+        cfg.token = Some(v);
+        cfg.credential = None;
     }
     if let Some(v) = args.cpu {
         cfg.cpu = v;
@@ -205,10 +217,10 @@ fn resolve_run_config(args: RunArgs) -> Result<WorkerConfig> {
     if let Some(v) = args.lease_secs {
         cfg.lease_secs = v;
     }
-    Ok(cfg)
+    Ok((cfg, config_path))
 }
 
-async fn run(cfg: WorkerConfig) -> Result<()> {
+async fn run(mut cfg: WorkerConfig, config_path: Option<PathBuf>) -> Result<()> {
     // Fail closed: never advertise more than the machine physically has.
     let host = detect_host()?;
     validate_capacity(cfg.cpu, cfg.memory, host)?;
@@ -219,8 +231,12 @@ async fn run(cfg: WorkerConfig) -> Result<()> {
         .await
         .unwrap_or_else(|_| "unknown".to_string());
 
-    // Register with the bootstrap token to obtain a worker credential.
-    let boot = ApiClient::new(&cfg.server, Some(cfg.token.clone()));
+    // Register to publish what this machine offers. The first start presents
+    // the one-shot join token and gets a credential back; every later start
+    // presents that credential, so an expired join token can never strand a
+    // worker that has already joined.
+    let bearer = cfg.bearer()?;
+    let registrar = ApiClient::new(&cfg.server, Some(bearer.expose().to_string()));
     let sys = detect_system_info();
     let request = serde_json::json!({
         "name": cfg.node,
@@ -240,7 +256,7 @@ async fn run(cfg: WorkerConfig) -> Result<()> {
     // first blocked connection tears the prompt's owner down before it can be
     // approved. It also rides out transient server outages.
     let resp = loop {
-        match boot.register(&request).await {
+        match registrar.register(&request).await {
             Ok(resp) => break resp,
             Err(e) => {
                 tracing::warn!("register failed, retrying in 10s: {e}");
@@ -248,13 +264,32 @@ async fn run(cfg: WorkerConfig) -> Result<()> {
             }
         }
     };
-    let credential = resp
-        .get("token")
-        .and_then(|v| v.as_str())
-        .map(str::to_string);
-    tracing::info!("registered worker {}", cfg.node);
+    // A join hands back a credential: persist it and erase the join token, in
+    // one write, before doing anything else with it.
+    if let Some(joined) = cfg.adopt(&bearer, &resp)? {
+        match &config_path {
+            Some(path) => {
+                let json = serde_json::to_string_pretty(&joined).context("serializing config")?;
+                write_file(path, &json, 0o600)?;
+                tracing::info!("joined as {}; join token consumed", cfg.node);
+            }
+            None => tracing::warn!(
+                "joined as {}, but no --config to persist the credential in — \
+                 this worker will need its join token again on the next start",
+                cfg.node
+            ),
+        }
+        cfg = joined;
+    } else {
+        tracing::info!("re-registered worker {} with its credential", cfg.node);
+    }
 
-    let client = ApiClient::new(&cfg.server, credential.or(Some(cfg.token.clone())));
+    // From here on the worker only ever speaks as itself: a join token is not
+    // a credential and the API will not accept one.
+    let Bearer::Credential(credential) = cfg.bearer()? else {
+        bail!("registration did not yield a worker credential");
+    };
+    let client = ApiClient::new(&cfg.server, Some(credential));
     let runtime: Arc<dyn ContainerRuntime> = Arc::new(runtime);
 
     tracing::info!("veloslet {} reconciling against {}", cfg.node, cfg.server);
@@ -341,11 +376,13 @@ fn install(args: InstallArgs) -> Result<()> {
         bail!("codesign verification failed for {bundle}");
     }
 
-    // 3. Persist config (0600 — it holds the bootstrap token).
+    // 3. Persist config (0600 — it holds the join token, and later the
+    //    credential the worker trades it for).
     let cfg = WorkerConfig {
         server: args.server,
         node: args.node,
-        token: args.token,
+        token: Some(args.token),
+        credential: None,
         cpu: args.cpu,
         memory: args.memory,
         reconcile_secs: args.reconcile_secs,
@@ -441,7 +478,10 @@ fn remove_dir_if_exists(path: &Path) -> Result<()> {
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
     match Cli::parse().command {
-        Command::Run(args) => run(resolve_run_config(args)?).await,
+        Command::Run(args) => {
+            let (cfg, config_path) = resolve_run_config(args)?;
+            run(cfg, config_path).await
+        }
         Command::Install(args) => install(args),
         Command::Uninstall(args) => uninstall(args),
     }

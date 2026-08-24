@@ -203,8 +203,14 @@ script can gate on it. It only reads; nothing it does changes state.
 ## 5. Register a worker
 
 Worker registration is a fail-closed, two-step flow: an **admin** mints a
-short-lived *bootstrap token*, then `veloslet` exchanges it for a durable,
-node-scoped worker credential on first start.
+short-lived *join token* (also called a bootstrap token), then `veloslet`
+exchanges it for a durable, node-scoped worker credential on first start.
+
+The exchange is **one-shot**. Once a worker holds a credential it presents that
+on every later start and never uses the join token again, so a join token that
+has expired (or been revoked) stops *new* workers joining without disturbing any
+worker already in the fleet. Revoking a worker's credential — which is what
+deleting the worker does — is the way to evict one for good.
 
 ```bash
 # As the logged-in admin, mint a bootstrap token and assemble it as `tokenId.secret`.
@@ -222,7 +228,7 @@ veloslet run --server http://127.0.0.1:8080 --node "$(hostname -s)" --token "$TO
 | `--config` | — | path to a JSON config file holding the settings below |
 | `--server` | *(required)* | control-plane base URL |
 | `--node` | *(required)* | this worker's unique name |
-| `--token` | *(required)* | bootstrap token used to register on start |
+| `--token` | *(required to join)* | join token, consumed by the first successful registration. Not needed once the config holds a credential; passing it again re-joins from scratch |
 | `--cpu` | *(required)* | advertised CPU cores; must not exceed the machine's |
 | `--memory` | *(required)* | advertised memory, e.g. `16G`; must not exceed the machine's |
 | `--reconcile-secs` | `5` | how often it reconciles its containers |
@@ -253,7 +259,9 @@ build that hardcoded capacity, existing installs must be re-run with these flags
 start.
 
 This writes the settings to `~/.velos/veloslet.json` (mode `0600` — it holds the
-token, so it's kept out of the process arguments), loads the agent, and starts it.
+secrets, so they're kept out of the process arguments), loads the agent, and
+starts it. On the first successful registration the worker rewrites that file,
+replacing `token` with the `credential` it was issued.
 The agent then runs `veloslet run --config ~/.velos/veloslet.json`. Logs go to
 `~/Library/Logs/veloslet.{out,err}.log`. Remove it with:
 
@@ -392,9 +400,15 @@ personal-access-token model). Revoking a token in the dashboard takes effect
 immediately. `velosctl login` stores its token + server in `~/.velos/config`
 (`0600`).
 
-**Worker credentials.** An admin mints a bootstrap token
-(`POST /auth/v1/tokens`); `veloslet` exchanges it (`POST /auth/v1/register`) for a
-durable `workerName.secret` credential and the server creates the `Worker` object.
+**Worker credentials.** An admin mints a join token (`POST /auth/v1/tokens`);
+`veloslet` exchanges it (`POST /auth/v1/register`) for a durable
+`workerName.secret` credential, and the server creates the `Worker` object.
+
+`register` also accepts a worker's own credential, which is how a restarting
+worker republishes its capacity and system info. That call mints nothing — only a
+join token does — so the join is one-shot and a worker can never be stranded by an
+expired one. A worker may only register under its own name; another worker's
+credential, or an admin token, is rejected with `403`.
 
 Auth endpoints at a glance:
 
@@ -405,8 +419,8 @@ Auth endpoints at a glance:
 | `POST /auth/v1/login` | open | username+password → session token |
 | `GET /auth/v1/me` | any valid token | echo the caller's identity |
 | `GET/POST /auth/v1/admin/tokens`, `DELETE …/{id}` | **admin** | list / create / revoke CLI tokens |
-| `POST /auth/v1/tokens` | **admin** | mint a worker bootstrap token |
-| `POST /auth/v1/register` | bootstrap token | join → worker credential |
+| `POST /auth/v1/tokens` | **admin** | mint a worker join (bootstrap) token |
+| `POST /auth/v1/register` | join token *or* the worker's own credential | join → worker credential; re-register → refresh only |
 
 > Identity is resolved behind a `TokenVerifier` seam, so an external OIDC provider
 > can be integrated later (validate a JWT against the provider) without changing
@@ -427,6 +441,7 @@ that fixes it. The table below covers the rest.
 | Container goes straight to `Failed` | The runtime couldn't run it (image pull failed, or the `container` CLI is missing on the worker). Check the `veloslet` logs. |
 | Worker shows `NotReady` | `veloslet` isn't renewing its lease — confirm it's running and can reach the server. |
 | Daemon (`veloslet install`) logs `error sending request` and never registers | On macOS, the **Local Network** prompt wasn't approved — enable *Velos Worker* under System Settings → Privacy & Security → Local Network (see §5). Note: this grant can't be reset with `tccutil`; it persists per bundle id even after the app is deleted. |
+| Worker logs `register failed, retrying in 10s: server returned 401` | Its secret is no longer accepted. Before it has joined, that means the join token expired or was revoked — mint a new one and re-run `veloslet install --token …`. After it has joined, it means the worker was deleted (which revokes its credential); it must join again. |
 | Dashboard says "server unreachable" | The server isn't running, or you opened the dev server while the server is down. |
 | `address already in use` on start | Something already holds `:8080` — `lsof -nP -iTCP:8080 -sTCP:LISTEN`. |
 

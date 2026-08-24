@@ -9,6 +9,8 @@ use std::sync::Arc;
 use velos_runtime::{ContainerRuntime, FakeRuntime};
 use velos_server::{app, controllers};
 use velos_store::{SqliteStore, Store};
+use veloslet::daemon::{Bearer, WorkerConfig};
+use veloslet::memory::Memory;
 use veloslet::{ApiClient, run_once};
 
 /// Bind an ephemeral port, serve the server in the background, and return the
@@ -403,6 +405,100 @@ async fn worker_registration_round_trips_node_info() {
         .unwrap();
     assert_eq!(w2["status"]["nodeInfo"]["agentVersion"], "unknown");
     assert_eq!(w2["status"]["nodeInfo"]["hostname"], "unknown");
+}
+
+/// The registration payload a worker publishes about itself.
+fn registration(cfg: &WorkerConfig) -> serde_json::Value {
+    serde_json::json!({
+        "name": cfg.node,
+        "capacity": { "cpu": cfg.cpu, "memoryBytes": cfg.memory.bytes() },
+        "addresses": [],
+        "containerRuntimeVersion": "fake/1.0",
+    })
+}
+
+/// One `veloslet` start: present whatever secret the config holds, register,
+/// and fold the response back in — exactly what `veloslet run` does, minus the
+/// container runtime. Returns the config as it would be left on disk.
+async fn worker_start(base: &str, cfg: WorkerConfig) -> WorkerConfig {
+    let bearer = cfg
+        .bearer()
+        .expect("a worker must have a secret to present");
+    let client = ApiClient::new(base, Some(bearer.expose().to_string()));
+    let resp = client.register(&registration(&cfg)).await.unwrap();
+    match cfg.adopt(&bearer, &resp).unwrap() {
+        Some(joined) => joined,
+        None => cfg,
+    }
+}
+
+#[tokio::test]
+async fn a_joined_worker_restarts_after_its_join_token_is_gone() {
+    // The bug this guards: veloslet used to keep the join token on disk and
+    // re-present it on every start, so every worker fell out of the fleet the
+    // first time it rebooted after its token's TTL ran out.
+    let base = start_auth().await;
+    let http = reqwest::Client::new();
+    let session = setup_and_login(&http, &base).await;
+    let mint = mint_bootstrap(&http, &base, &session, "fleet").await;
+    let boot_tok = joined(&mint);
+
+    let cfg = WorkerConfig {
+        server: base.clone(),
+        node: "w1".to_string(),
+        token: Some(boot_tok.clone()),
+        credential: None,
+        cpu: 4,
+        memory: Memory::from_bytes(8 * 1024 * 1024 * 1024),
+        reconcile_secs: 5,
+        heartbeat_secs: 10,
+        lease_secs: 40,
+    };
+
+    // First start: joins, and trades the join token for a credential.
+    let cfg = worker_start(&base, cfg).await;
+    assert_eq!(cfg.token, None, "the join token must be consumed");
+    let credential = cfg.credential.clone().expect("a credential was issued");
+    assert!(credential.starts_with("w1."));
+
+    // The admin retires the join token — the same state an expiry produces.
+    let r = http
+        .delete(format!(
+            "{base}/auth/v1/tokens/{}",
+            mint["tokenId"].as_str().unwrap()
+        ))
+        .bearer_auth(&session)
+        .send()
+        .await
+        .unwrap();
+    assert!(r.status().is_success());
+
+    // Restart, reading the config back off disk. It must still come up, and
+    // still hold the same credential afterwards.
+    let text = serde_json::to_string(&cfg).unwrap();
+    let from_disk: WorkerConfig = serde_json::from_str(&text).unwrap();
+    assert_eq!(
+        from_disk.bearer().unwrap(),
+        Bearer::Credential(credential.clone())
+    );
+    let after = worker_start(&base, from_disk).await;
+    assert_eq!(after.credential, Some(credential.clone()));
+
+    // And it can do its job: renew its lease with that credential.
+    ApiClient::new(&base, Some(credential))
+        .renew_lease("w1", 40)
+        .await
+        .unwrap();
+    let lease = http
+        .get(format!("{base}/api/v1/leases/w1"))
+        .bearer_auth(&session)
+        .send()
+        .await
+        .unwrap()
+        .json::<serde_json::Value>()
+        .await
+        .unwrap();
+    assert_eq!(lease["spec"]["holderIdentity"], "w1");
 }
 
 #[tokio::test]
