@@ -22,18 +22,23 @@ export function Overview() {
   const { data: workers = [] } = useWorkers();
   const { data: containers = [] } = useContainers();
 
-  const ready = workers.filter(isWorkerReady).length;
+  const readyWorkers = workers.filter(isWorkerReady);
+  const ready = readyWorkers.length;
   const running = containers.filter((c) => phaseOf(c) === "Running").length;
 
-  // Cluster capacity vs. what scheduled/running containers have committed.
-  const capCpu = workers.reduce((a, w) => a + (w.status?.allocatable?.cpu ?? 0), 0);
-  const capMem = workers.reduce((a, w) => a + (w.status?.allocatable?.memoryBytes ?? 0), 0);
-  const usedCpu = containers
-    .filter((c) => ACTIVE.includes(phaseOf(c)))
-    .reduce((a, c) => a + (c.spec.resources?.cpu ?? 1), 0);
-  const usedMem = containers
-    .filter((c) => ACTIVE.includes(phaseOf(c)))
-    .reduce((a, c) => a + (c.spec.resources?.memoryBytes ?? 512 * 1024 ** 2), 0);
+  // Cluster capacity vs. what scheduled/running containers have committed. Only
+  // Ready workers count: the scheduler refuses to place onto a NotReady worker,
+  // so its last-reported cores are not capacity anyone can use. Usage is filtered
+  // the same way — a container stranded on a NotReady worker is not holding a
+  // share of what is left, and counting it would push the bar past 100%.
+  const readyNames = new Set(readyWorkers.map((w) => w.metadata.name));
+  const capCpu = readyWorkers.reduce((a, w) => a + (w.status?.allocatable?.cpu ?? 0), 0);
+  const capMem = readyWorkers.reduce((a, w) => a + (w.status?.allocatable?.memoryBytes ?? 0), 0);
+  const committed = containers.filter(
+    (c) => ACTIVE.includes(phaseOf(c)) && !!c.spec.nodeName && readyNames.has(c.spec.nodeName),
+  );
+  const usedCpu = committed.reduce((a, c) => a + (c.spec.resources?.cpu ?? 1), 0);
+  const usedMem = committed.reduce((a, c) => a + (c.spec.resources?.memoryBytes ?? 512 * 1024 ** 2), 0);
 
   const byPhase = ORDER.map((p) => ({ phase: p, n: containers.filter((c) => phaseOf(c) === p).length })).filter(
     (x) => x.n > 0,

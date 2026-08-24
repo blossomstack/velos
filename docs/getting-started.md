@@ -407,8 +407,9 @@ per-command: `velosctl --server http://other:8080 --token <tok> get workers`.
 The dashboard is served by the server — just open **`http://127.0.0.1:8080`**.
 After signing in (§4) it gives you:
 
-- **Overview** — workers ready, container counts, cluster CPU/memory allocation,
-  and a containers-by-phase breakdown.
+- **Overview** — workers ready, container counts, cluster CPU/memory allocation
+  (counted over **Ready** workers only, since nothing can be scheduled onto a
+  NotReady one), and a containers-by-phase breakdown.
 - **Workers** — per-node cards (Ready status, runtime version, live allocation,
   slot usage, lease freshness) with a detail drawer.
 - **Containers** — a phase-filterable table with a **Launch container** form,
