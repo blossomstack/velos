@@ -683,12 +683,16 @@ dependencies = [
 
 [[package]]
 name = "chumsky"
-version = "0.9.3"
+version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8eebd66744a15ded14960ab4ccdbfb51ad3b81f51f3f04a80adac98c985396c9"
+checksum = "e0d2bfadce76f963d776feff99db6dc33783829539258314776383b33e2a00f8"
 dependencies = [
- "hashbrown 0.14.5",
+ "hashbrown 0.15.5",
+ "regex-automata",
+ "serde",
  "stacker",
+ "unicode-ident",
+ "unicode-segmentation",
 ]
 
 [[package]]
@@ -1294,18 +1298,18 @@ dependencies = [
 
 [[package]]
 name = "fluorite"
-version = "0.7.0"
+version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0fa1a708aa357ab6988d028a36fcd254f16eed5a79e3363b49a2999fdce7c8bc"
+checksum = "90920e402381d0f936c36c5a7a31b6067e13e68449e90bc9b3a5b7c2c17a9e89"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "fluorite_codegen"
-version = "0.7.0"
+version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ba8c71a72f55aab3c3bfdf09eaf448af91ce075d9f707f386cc5c307ec5add95"
+checksum = "a5ae7e0964090a2e74a04426e5c6239a438bf4788a030ac836585f71c66444a0"
 dependencies = [
  "anyhow",
  "ariadne",
@@ -1542,7 +1546,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e5274423e17b7c9fc20b6e7e208532f9b19825d82dfd615708b70edd83df41f1"
 dependencies = [
  "ahash",
- "allocator-api2",
 ]
 
 [[package]]
@@ -1551,6 +1554,8 @@ version = "0.15.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9229cfe53dfd69f0609a49f65461bd93001ea1ef889cd5529dd176593f5338a1"
 dependencies = [
+ "allocator-api2",
+ "equivalent",
  "foldhash 0.1.5",
 ]
 
@@ -3999,6 +4004,12 @@ name = "unicode-ident"
 version = "1.0.24"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
+
+[[package]]
+name = "unicode-segmentation"
+version = "1.13.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c6f5d3c3b1bf09027a88a6bc961fc00497d651009560b5463668dc81b0fa87a8"
 
 [[package]]
 name = "unicode-width"
