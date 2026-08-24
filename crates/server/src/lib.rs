@@ -747,7 +747,22 @@ async fn revoke_bootstrap_token(
     Ok(Json(serde_json::json!({ "revoked": id })))
 }
 
-/// `POST /auth/v1/register` — join with a bootstrap token, get a credential.
+/// How a registration authenticated itself.
+enum Registration {
+    /// A first join, presenting a bootstrap token. Mints the worker credential.
+    Join,
+    /// A restart, presenting the credential a previous join minted. Refreshes
+    /// what the worker advertises and mints nothing.
+    Refresh,
+}
+
+/// `POST /auth/v1/register` — publish what this machine offers.
+///
+/// A first join presents a bootstrap token and receives a durable worker
+/// credential in exchange; that token is then done. Every later start
+/// re-registers with the credential itself, which mints nothing. Keeping the
+/// two apart is what makes the bootstrap token's expiry a real join window
+/// instead of a fuse under every already-joined worker.
 async fn register(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -755,14 +770,25 @@ async fn register(
 ) -> Result<Json<Value>, ApiError> {
     let auth = state.auth.as_ref().ok_or(ApiError::NotFound)?;
     let token = bearer(&headers).ok_or(ApiError::Unauthorized)?;
-    auth.verify_bootstrap(&token)
-        .map_err(|_| ApiError::Unauthorized)?;
 
     let name = req
         .get("name")
         .and_then(Value::as_str)
         .ok_or_else(|| ApiError::BadRequest("name required".into()))?
         .to_string();
+
+    // Fail closed: a bootstrap token, or this worker's own credential. Nothing
+    // else registers — a worker may only ever re-register under its own name,
+    // and registering is a worker act, not an admin one.
+    let how = if auth.verify_bootstrap(&token).is_ok() {
+        Registration::Join
+    } else {
+        match auth.authenticate(&token) {
+            Some(Identity::Worker(who)) if who == name => Registration::Refresh,
+            Some(Identity::Worker(_)) | Some(Identity::Admin) => return Err(ApiError::Forbidden),
+            None => return Err(ApiError::Unauthorized),
+        }
+    };
     let capacity = req
         .get("capacity")
         .cloned()
@@ -811,13 +837,19 @@ async fn register(
         document: doc,
     })?;
 
-    let credential = auth
-        .issue_credential(&name)
-        .map_err(|e| ApiError::Internal(e.to_string()))?;
-    Ok(Json(serde_json::json!({
-        "workerName": name,
-        "token": credential,
-    })))
+    match how {
+        Registration::Join => {
+            let credential = auth
+                .issue_credential(&name)
+                .map_err(|e| ApiError::Internal(e.to_string()))?;
+            Ok(Json(serde_json::json!({
+                "workerName": name,
+                "token": credential,
+            })))
+        }
+        // No new credential: the worker already holds one and re-presented it.
+        Registration::Refresh => Ok(Json(serde_json::json!({ "workerName": name }))),
+    }
 }
 
 /// Authenticate every `/api/v1` request. Admins get full access; workers are
@@ -2127,6 +2159,176 @@ mod tests {
         )
         .await;
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    /// Mint a bootstrap token as admin and return it as `id.secret`.
+    async fn mint_bootstrap(app: &axum::Router, session: &str, ttl_secs: i64) -> String {
+        let resp = send(
+            app,
+            Request::builder()
+                .method("POST")
+                .uri("/auth/v1/tokens")
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {session}"))
+                .body(Body::from(
+                    serde_json::json!({ "ttlSeconds": ttl_secs }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let tok = body_json(resp).await;
+        format!(
+            "{}.{}",
+            tok["tokenId"].as_str().unwrap(),
+            tok["secret"].as_str().unwrap()
+        )
+    }
+
+    /// `POST /auth/v1/register` for `name`, presenting `token`.
+    async fn register_as(app: &axum::Router, token: &str, name: &str) -> axum::response::Response {
+        send(
+            app,
+            Request::builder()
+                .method("POST")
+                .uri("/auth/v1/register")
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::from(
+                    serde_json::json!({
+                        "name": name,
+                        "capacity": { "cpu": 4, "memoryBytes": 8589934592u64 },
+                        "containerRuntimeVersion": "fake/1.0"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+    }
+
+    /// Join `name` with a fresh bootstrap token; returns `(bootstrap, credential)`.
+    async fn join_worker(app: &axum::Router, session: &str, name: &str) -> (String, String) {
+        let boot = mint_bootstrap(app, session, 60).await;
+        let resp = register_as(app, &boot, name).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let credential = body_json(resp).await["token"].as_str().unwrap().to_string();
+        (boot, credential)
+    }
+
+    #[tokio::test]
+    async fn re_registering_with_the_worker_credential_mints_nothing() {
+        let app = auth_app();
+        let session = setup_and_login(&app).await;
+        let (_, credential) = join_worker(&app, &session, "w1").await;
+
+        // A restart re-registers as itself: accepted, but no second credential
+        // is handed out — the one the worker already holds stays valid.
+        let resp = register_as(&app, &credential, "w1").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["workerName"], "w1");
+        assert!(
+            body.get("token").is_none(),
+            "a refresh must not mint a credential: {body}"
+        );
+
+        let resp = send(
+            &app,
+            Request::builder()
+                .method("GET")
+                .uri("/api/v1/workers/w1")
+                .header("authorization", format!("Bearer {credential}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn an_unusable_join_token_cannot_strand_an_already_joined_worker() {
+        let app = auth_app();
+        let session = setup_and_login(&app).await;
+        let (boot, credential) = join_worker(&app, &session, "w1").await;
+
+        // Retire the join token — expiry and revocation fail `verify_bootstrap`
+        // through exactly the same path, and revocation is the one a test can
+        // reach without waiting out a TTL.
+        let resp = send(
+            &app,
+            Request::builder()
+                .method("DELETE")
+                .uri(format!(
+                    "/auth/v1/tokens/{}",
+                    boot.split('.').next().unwrap()
+                ))
+                .header("authorization", format!("Bearer {session}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // The dead token no longer joins anyone...
+        let resp = register_as(&app, &boot, "w2").await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        // ...but the worker that already joined restarts perfectly well.
+        let resp = register_as(&app, &credential, "w1").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn an_expired_join_token_never_joins() {
+        let app = auth_app();
+        let session = setup_and_login(&app).await;
+        let expired = mint_bootstrap(&app, &session, -1).await;
+        let resp = register_as(&app, &expired, "w1").await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn a_worker_cannot_register_under_another_name() {
+        let app = auth_app();
+        let session = setup_and_login(&app).await;
+        let (_, credential) = join_worker(&app, &session, "w1").await;
+
+        // Authenticated, but not as w2 — a credential is scoped to one worker.
+        let resp = register_as(&app, &credential, "w2").await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn an_admin_token_does_not_register_a_worker() {
+        let app = auth_app();
+        let session = setup_and_login(&app).await;
+        let resp = register_as(&app, &session, "w1").await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn a_revoked_credential_cannot_re_register() {
+        let app = auth_app();
+        let session = setup_and_login(&app).await;
+        let (_, credential) = join_worker(&app, &session, "w1").await;
+
+        // Deleting the worker revokes its credential; that is the eviction
+        // control, so a restart must not walk back in.
+        let resp = send(
+            &app,
+            Request::builder()
+                .method("DELETE")
+                .uri("/api/v1/workers/w1")
+                .header("authorization", format!("Bearer {session}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+        let resp = register_as(&app, &credential, "w1").await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
