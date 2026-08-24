@@ -6,6 +6,7 @@
 //! liveness heartbeat. The worker is authoritative for container `status`.
 
 pub mod client;
+pub mod config;
 pub mod daemon;
 pub mod host;
 pub mod memory;

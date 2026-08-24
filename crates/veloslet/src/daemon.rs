@@ -81,31 +81,33 @@ impl std::fmt::Debug for Bearer {
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum JoinError {
     #[error(
-        "worker config holds neither a credential nor a join token; \
-         mint one with `velosctl token create` and re-run `veloslet install --token <token>`"
+        "this worker has not joined a control plane yet; \
+         mint a join token with `velosctl token create`, then run \
+         `veloslet setup --server <url> --node <name> --token <token> --cpu <n> --memory <size>`"
     )]
-    NoSecret,
+    NotConnected,
     #[error("the server accepted the join token but returned no worker credential")]
     NoCredentialIssued,
 }
 
 /// Persisted worker configuration (written as JSON to `~/.velos/veloslet.json`).
 ///
-/// The secrets live here — not in the LaunchAgent's argument vector — so they
-/// never show up in the process table (`ps`). The file is created `0600`.
+/// The credential lives here — not in the LaunchAgent's argument vector — so it
+/// never shows up in the process table (`ps`). The file is created `0600`.
+///
+/// A join token is deliberately *not* a field. `veloslet setup` trades one for a
+/// credential and never writes it down, so the illegal state "a worker still
+/// holding a spent join token" cannot be represented (Principle #2), and an
+/// expired token can never strand a worker that has already joined.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkerConfig {
     /// Server base URL, e.g. `http://192.168.68.60:8088`.
     pub server: String,
     /// This worker's name.
     pub node: String,
-    /// One-shot join token (`id.secret`), present only until this worker has
-    /// joined. The first successful registration replaces it with `credential`,
-    /// so an expired join token can never strand a worker that already joined.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub token: Option<String>,
     /// The worker credential (`node.secret`) issued at join, re-presented on
     /// every later start. Revoking it is what evicts this worker for good.
+    /// Absent until `veloslet setup` has run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credential: Option<String>,
     /// Advertised CPU cores. Required; validated against the host at startup.
@@ -121,40 +123,42 @@ pub struct WorkerConfig {
 }
 
 impl WorkerConfig {
-    /// The secret to present at registration: the credential once this worker
-    /// has joined, otherwise the one-shot join token. Fails closed when it holds
-    /// neither (Principle #6) rather than registering anonymously.
+    /// The secret this worker presents on every start. Fails closed when it has
+    /// not joined yet (Principle #6) rather than registering anonymously.
     pub fn bearer(&self) -> Result<Bearer, JoinError> {
-        match (&self.credential, &self.token) {
-            (Some(c), _) => Ok(Bearer::Credential(c.clone())),
-            (None, Some(t)) => Ok(Bearer::Join(t.clone())),
-            (None, None) => Err(JoinError::NoSecret),
-        }
+        self.credential
+            .clone()
+            .map(Bearer::Credential)
+            .ok_or(JoinError::NotConnected)
     }
 
-    /// Fold a successful registration response into the persisted config.
-    ///
-    /// A [`Bearer::Join`] registration must come back with a credential: it is
-    /// stored and the join token erased, which is what consumes the join. A
-    /// [`Bearer::Credential`] registration only refreshes what the worker
-    /// advertises, so there is nothing to write back (`Ok(None)`).
-    pub fn adopt(&self, bearer: &Bearer, response: &Value) -> Result<Option<Self>, JoinError> {
-        match bearer {
-            Bearer::Credential(_) => Ok(None),
-            Bearer::Join(_) => {
-                let credential = response
-                    .get("token")
-                    .and_then(Value::as_str)
-                    .filter(|s| !s.is_empty())
-                    .ok_or(JoinError::NoCredentialIssued)?;
-                Ok(Some(Self {
-                    token: None,
-                    credential: Some(credential.to_string()),
-                    ..self.clone()
-                }))
-            }
+    /// Whether `veloslet setup` has been run against a control plane.
+    pub fn is_connected(&self) -> bool {
+        self.credential.is_some()
+    }
+
+    /// The config as it should be persisted after a successful join.
+    pub fn with_credential(&self, credential: String) -> Self {
+        Self {
+            credential: Some(credential),
+            ..self.clone()
         }
     }
+}
+
+/// Read the worker credential out of a registration response.
+///
+/// A [`Bearer::Join`] registration must come back with one — that exchange *is*
+/// the join. An empty or absent `token` means the server accepted the join token
+/// without minting anything, which would leave the worker unable to speak as
+/// itself, so it is an error rather than a silently credential-less config.
+pub fn credential_from_response(response: &Value) -> Result<String, JoinError> {
+    response
+        .get("token")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .ok_or(JoinError::NoCredentialIssued)
 }
 
 /// Minimal XML text escaping for plist `<string>` values.
@@ -262,12 +266,11 @@ pub fn render_launch_agent(
 mod tests {
     use super::*;
 
-    /// A config as `veloslet install` writes it: a join token, no credential yet.
+    /// A config as `veloslet config`/`setup` writes it before the join lands.
     fn unjoined() -> WorkerConfig {
         WorkerConfig {
             server: "http://192.168.68.60:8088".to_string(),
             node: "node-a".to_string(),
-            token: Some("id.secret".to_string()),
             credential: None,
             cpu: 4,
             memory: Memory::from_bytes(8 * 1024 * 1024 * 1024),
@@ -284,11 +287,7 @@ mod tests {
         let back: WorkerConfig = serde_json::from_str(&text).unwrap();
         assert_eq!(cfg, back);
 
-        let joined = WorkerConfig {
-            token: None,
-            credential: Some("node-a.secret".to_string()),
-            ..cfg
-        };
+        let joined = cfg.with_credential("node-a.secret".to_string());
         let text = serde_json::to_string(&joined).unwrap();
         let back: WorkerConfig = serde_json::from_str(&text).unwrap();
         assert_eq!(joined, back);
@@ -296,10 +295,9 @@ mod tests {
 
     #[test]
     fn config_applies_interval_defaults_when_omitted() {
-        let cfg: WorkerConfig = serde_json::from_str(
-            r#"{"server":"http://h:1","node":"n","token":"t","cpu":4,"memory":"8G"}"#,
-        )
-        .unwrap();
+        let cfg: WorkerConfig =
+            serde_json::from_str(r#"{"server":"http://h:1","node":"n","cpu":4,"memory":"8G"}"#)
+                .unwrap();
         assert_eq!(cfg.cpu, 4);
         assert_eq!(cfg.memory.bytes(), 8 * 1024 * 1024 * 1024);
         assert_eq!(cfg.reconcile_secs, 5);
@@ -308,29 +306,31 @@ mod tests {
     }
 
     #[test]
-    fn a_consumed_join_token_is_not_serialized_back_to_disk() {
-        // The whole point of the one-shot join: after adopting a credential the
-        // written config must carry no join token at all, not an empty one.
-        let joined = unjoined()
-            .adopt(
-                &Bearer::Join("id.secret".to_string()),
-                &serde_json::json!({ "workerName": "node-a", "token": "node-a.secret" }),
-            )
-            .unwrap()
-            .unwrap();
+    fn a_join_token_is_never_serialized_to_disk() {
+        // The one-shot join, enforced by construction: `WorkerConfig` has no
+        // field a join token could occupy, so no write can leak one. A worker
+        // therefore cannot be stranded by its join token expiring.
+        let joined = unjoined().with_credential("node-a.secret".to_string());
         let text = serde_json::to_string(&joined).unwrap();
-        assert!(!text.contains("token"), "join token leaked into {text}");
+        assert!(
+            !text.contains("\"token\""),
+            "a token field appeared in {text}"
+        );
         assert!(text.contains("credential"));
     }
 
     #[test]
-    fn bearer_prefers_the_credential_over_a_leftover_join_token() {
-        let cfg = WorkerConfig {
-            credential: Some("node-a.secret".to_string()),
-            ..unjoined()
-        };
-        // Even with a join token still on disk (e.g. the rewrite failed), a
-        // joined worker presents its credential — never the token again.
+    fn an_unjoined_config_omits_the_credential_key_entirely() {
+        // Not `"credential": null` — nothing at all, so a hand-inspected config
+        // reads unambiguously as "this worker has not joined".
+        let text = serde_json::to_string(&unjoined()).unwrap();
+        assert!(!text.contains("credential"), "{text}");
+    }
+
+    #[test]
+    fn bearer_presents_the_credential_once_joined() {
+        let cfg = unjoined().with_credential("node-a.secret".to_string());
+        assert!(cfg.is_connected());
         assert_eq!(
             cfg.bearer().unwrap(),
             Bearer::Credential("node-a.secret".to_string())
@@ -338,73 +338,39 @@ mod tests {
     }
 
     #[test]
-    fn bearer_uses_the_join_token_until_the_worker_has_joined() {
-        assert_eq!(
-            unjoined().bearer().unwrap(),
-            Bearer::Join("id.secret".to_string())
-        );
-    }
-
-    #[test]
-    fn bearer_fails_closed_with_neither_secret() {
-        let cfg = WorkerConfig {
-            token: None,
-            ..unjoined()
-        };
-        assert_eq!(cfg.bearer(), Err(JoinError::NoSecret));
-    }
-
-    #[test]
-    fn adopt_stores_the_credential_and_erases_the_join_token() {
+    fn bearer_fails_closed_before_the_worker_has_joined() {
         let cfg = unjoined();
-        let updated = cfg
-            .adopt(
-                &Bearer::Join("id.secret".to_string()),
-                &serde_json::json!({ "workerName": "node-a", "token": "node-a.secret" }),
-            )
-            .unwrap()
-            .expect("a join must be written back");
-        assert_eq!(updated.token, None);
-        assert_eq!(updated.credential, Some("node-a.secret".to_string()));
-        // Everything else is untouched.
-        assert_eq!(updated.server, cfg.server);
-        assert_eq!(updated.node, cfg.node);
-        assert_eq!(updated.lease_secs, cfg.lease_secs);
-        assert_eq!(
-            updated.bearer().unwrap(),
-            Bearer::Credential("node-a.secret".to_string())
-        );
+        assert!(!cfg.is_connected());
+        assert_eq!(cfg.bearer(), Err(JoinError::NotConnected));
     }
 
     #[test]
-    fn adopt_writes_nothing_back_when_re_registering_with_a_credential() {
-        let cfg = WorkerConfig {
-            token: None,
-            credential: Some("node-a.secret".to_string()),
-            ..unjoined()
-        };
-        // A restart re-registers to refresh what it advertises; the server
-        // issues no new credential, so there is nothing to persist.
-        let updated = cfg
-            .adopt(
-                &Bearer::Credential("node-a.secret".to_string()),
-                &serde_json::json!({ "workerName": "node-a" }),
-            )
-            .unwrap();
-        assert_eq!(updated, None);
-    }
-
-    #[test]
-    fn adopt_fails_closed_when_a_join_returns_no_credential() {
+    fn with_credential_leaves_every_other_field_alone() {
         let cfg = unjoined();
-        let join = Bearer::Join("id.secret".to_string());
+        let joined = cfg.with_credential("node-a.secret".to_string());
+        assert_eq!(joined.credential, Some("node-a.secret".to_string()));
+        assert_eq!(joined.server, cfg.server);
+        assert_eq!(joined.node, cfg.node);
+        assert_eq!(joined.cpu, cfg.cpu);
+        assert_eq!(joined.memory, cfg.memory);
+        assert_eq!(joined.lease_secs, cfg.lease_secs);
+    }
+
+    #[test]
+    fn a_join_response_without_a_credential_fails_closed() {
         assert_eq!(
-            cfg.adopt(&join, &serde_json::json!({ "workerName": "node-a" })),
+            credential_from_response(&serde_json::json!({ "workerName": "node-a" })),
             Err(JoinError::NoCredentialIssued)
         );
         assert_eq!(
-            cfg.adopt(&join, &serde_json::json!({ "token": "" })),
+            credential_from_response(&serde_json::json!({ "token": "" })),
             Err(JoinError::NoCredentialIssued)
+        );
+        assert_eq!(
+            credential_from_response(
+                &serde_json::json!({ "workerName": "node-a", "token": "node-a.secret" })
+            ),
+            Ok("node-a.secret".to_string())
         );
     }
 
