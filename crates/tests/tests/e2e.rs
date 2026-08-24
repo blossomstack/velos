@@ -109,6 +109,119 @@ async fn container_runs_through_full_lifecycle() {
     assert_eq!(c["status"]["exitCode"], 0);
 }
 
+/// Post a ready worker with capacity for a handful of small containers.
+async fn post_ready_worker(http: &reqwest::Client, base: &str, name: &str) {
+    post(
+        http,
+        base,
+        "workers",
+        serde_json::json!({
+            "metadata": { "name": name },
+            "spec": { "unschedulable": false },
+            "status": {
+                "allocatable": { "cpu": 4, "memoryBytes": 8589934592u64 },
+                "conditions": [{ "conditionType": "Ready", "status": true }]
+            }
+        }),
+    )
+    .await;
+}
+
+async fn post_pending_container(http: &reqwest::Client, base: &str, name: &str, image: &str) {
+    post(
+        http,
+        base,
+        "containers",
+        serde_json::json!({
+            "metadata": { "name": name },
+            "spec": { "image": image, "resources": { "cpu": 1, "memoryBytes": 536870912u64 } },
+            "status": { "phase": "Pending" }
+        }),
+    )
+    .await;
+}
+
+/// A container whose image cannot be launched used to sit in `Scheduled`
+/// forever with nothing anywhere to say why: the worker's error aborted the
+/// pass and was logged without even naming the container, and the control plane
+/// was never told. The failure has to reach the object itself.
+///
+/// The phase stays `Scheduled` deliberately — the container really is bound and
+/// not running, and the worker keeps retrying — so `reason` is what carries the
+/// news.
+#[tokio::test]
+async fn a_launch_failure_is_published_on_the_container() {
+    let (base, store) = start().await;
+    let http = reqwest::Client::new();
+    post_ready_worker(&http, &base, "w1").await;
+    post_pending_container(&http, &base, "c1", "ghcr.io/o/runtime:not-an-image").await;
+    controllers::reconcile_scheduling(store.as_ref()).unwrap();
+
+    let client = ApiClient::new(&base, None);
+    let runtime = FakeRuntime::new();
+    runtime
+        .fail_image("ghcr.io/o/runtime:not-an-image", "no such image")
+        .unwrap();
+
+    // The pass applies nothing, and says so, rather than reporting a phantom
+    // launch.
+    assert_eq!(run_once(&client, &runtime, "w1").await.unwrap(), 0);
+
+    let c = get_container(&http, &base, "c1").await;
+    assert_eq!(c["status"]["phase"], "Scheduled");
+    assert_eq!(c["status"]["workerName"], "w1");
+    assert_eq!(c["status"]["reason"], "StartFailed");
+    assert!(
+        c["status"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("no such image"),
+        "the runtime's own words must survive to the object: {}",
+        c["status"]["message"]
+    );
+
+    // Re-reporting an unchanged failure would append a store write and a watch
+    // event every reconcile tick, forever, for the one failure that never
+    // resolves on its own.
+    let rv = c["metadata"]["resourceVersion"].clone();
+    assert_eq!(run_once(&client, &runtime, "w1").await.unwrap(), 0);
+    let c = get_container(&http, &base, "c1").await;
+    assert_eq!(c["metadata"]["resourceVersion"], rv);
+
+    // And it is not terminal: the worker keeps trying, so a registry that comes
+    // back means the container still starts.
+    let runtime = FakeRuntime::new();
+    assert_eq!(run_once(&client, &runtime, "w1").await.unwrap(), 1);
+    let c = get_container(&http, &base, "c1").await;
+    assert_eq!(c["status"]["phase"], "Running");
+    assert_eq!(c["status"]["reason"], serde_json::Value::Null);
+}
+
+/// One container that cannot launch used to abort the whole reconcile pass, so
+/// every other container assigned to that worker stopped converging behind it.
+#[tokio::test]
+async fn a_container_that_cannot_launch_does_not_block_its_neighbours() {
+    let (base, store) = start().await;
+    let http = reqwest::Client::new();
+    post_ready_worker(&http, &base, "w1").await;
+    // "broken" sorts first, so it is the one the pass would have died on.
+    post_pending_container(&http, &base, "broken", "ghcr.io/o/runtime:not-an-image").await;
+    post_pending_container(&http, &base, "healthy", "alpine").await;
+    controllers::reconcile_scheduling(store.as_ref()).unwrap();
+
+    let client = ApiClient::new(&base, None);
+    let runtime = FakeRuntime::new();
+    runtime
+        .fail_image("ghcr.io/o/runtime:not-an-image", "no such image")
+        .unwrap();
+    assert_eq!(run_once(&client, &runtime, "w1").await.unwrap(), 1);
+
+    let broken = get_container(&http, &base, "broken").await;
+    assert_eq!(broken["status"]["reason"], "StartFailed");
+    let healthy = get_container(&http, &base, "healthy").await;
+    assert_eq!(healthy["status"]["phase"], "Running");
+}
+
 /// A Service must turn into a port on the worker that actually carries traffic
 /// to the container, and into an endpoint list the control plane publishes.
 /// Those are the two halves of "expose this container": the data path and the

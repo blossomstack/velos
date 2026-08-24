@@ -129,6 +129,37 @@ fn hibernated_status(node: &str) -> Value {
     })
 }
 
+/// A container's current status with a failed action recorded on it.
+///
+/// The phase is deliberately left alone. A launch that failed does not make the
+/// container something other than `Scheduled`: it is still bound to this worker
+/// and still not running, and the worker will try again on the next tick. Only
+/// the worker's own retries can change that, and it has no way to tell an image
+/// that will never pull from a registry having a bad minute — so declaring the
+/// container `Failed` here would be a verdict it cannot justify. What was
+/// missing was never a different phase, it was the reason.
+///
+/// The status subresource replaces the whole object, so `current` is restated
+/// verbatim; anything dropped here would be erased.
+fn failed_status(current: &Value, node: &str, reason: &str, message: &str) -> Value {
+    let mut status = current.as_object().cloned().unwrap_or_default();
+    status.insert("workerName".to_string(), serde_json::json!(node));
+    status.insert("reason".to_string(), serde_json::json!(reason));
+    status.insert("message".to_string(), serde_json::json!(message));
+    Value::Object(status)
+}
+
+/// Whether `current` does not already record exactly this failure.
+///
+/// The worker retries a failing action on every reconcile tick, and every status
+/// write is a store write plus a watch event. Re-reporting an unchanged failure
+/// would append an event every few seconds for as long as the container stays
+/// broken — which, for the failure this exists to surface, is forever.
+fn failure_is_new(current: &Value, reason: &str, message: &str) -> bool {
+    current.get("reason").and_then(Value::as_str) != Some(reason)
+        || current.get("message").and_then(Value::as_str) != Some(message)
+}
+
 fn terminal_status(node: &str, phase: &str, exit_code: i32) -> Value {
     serde_json::json!({
         "phase": phase,
@@ -250,11 +281,61 @@ pub async fn run_once(
         .collect();
 
     let actions = reconcile(&desired, &observed);
-    let n = actions.len();
+    let mut applied = 0;
     for action in actions {
-        apply_action(client, runtime, node, action).await?;
+        // Read what the action targets before it is consumed, so a failure can
+        // be attributed to a container rather than to the pass as a whole.
+        let target = action.container().map(str::to_string);
+        let reason = action.failure_reason();
+        match apply_action(client, runtime, node, action).await {
+            Ok(()) => applied += 1,
+            // Isolated on purpose: one container that cannot start must not cost
+            // every other container on this worker its reconcile pass.
+            Err(e) => report_failure(client, &assigned, node, target.as_deref(), reason, &e).await,
+        }
     }
-    Ok(n)
+    Ok(applied)
+}
+
+/// Log a failed action against the container it was for and, when the failure is
+/// that container's to carry, publish it as `status.reason` + `status.message`.
+///
+/// Without this a failing action was visible only in this worker's log, and only
+/// as `reconcile failed: <error>` — no container name, and nothing at all on the
+/// control plane, so the container simply sat in `Scheduled` with no way to ask
+/// why from the API or the dashboard.
+async fn report_failure(
+    client: &ApiClient,
+    assigned: &[Value],
+    node: &str,
+    name: Option<&str>,
+    reason: Option<&'static str>,
+    err: &VelosletError,
+) {
+    let message = err.to_string();
+    let Some(name) = name else {
+        tracing::warn!("reaping an orphaned instance failed: {message}");
+        return;
+    };
+    tracing::warn!("container {name}: {message}");
+    let Some(reason) = reason else {
+        return;
+    };
+    let current = assigned
+        .iter()
+        .find(|doc| str_at(doc, &["metadata", "name"]) == Some(name))
+        .and_then(|doc| doc.get("status"))
+        .cloned()
+        .unwrap_or_else(|| Value::Object(serde_json::Map::new()));
+    if !failure_is_new(&current, reason, &message) {
+        return;
+    }
+    if let Err(e) = client
+        .put_status(name, failed_status(&current, node, reason, &message))
+        .await
+    {
+        tracing::warn!("container {name}: reporting the failure above failed too: {e}");
+    }
 }
 
 // ---------------------------------------------------------------------------

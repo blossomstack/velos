@@ -93,6 +93,12 @@ pub struct FakeRuntime {
     instances: Mutex<HashMap<String, Instance>>,
     runs: Mutex<usize>,
     instance_ip: String,
+    /// Images whose launch fails, mapped to the message it fails with. Keyed by
+    /// image rather than by uid because the failure a worker cannot recover
+    /// from — an unpullable image — is a property of the image, and a test
+    /// should be able to break one container while leaving its neighbours on
+    /// the same worker launchable.
+    run_failures: Mutex<HashMap<String, String>>,
 }
 
 impl Default for FakeRuntime {
@@ -103,6 +109,7 @@ impl Default for FakeRuntime {
             // Loopback, so a test can put a real listener behind a fake
             // instance and drive traffic through the worker's service proxy.
             instance_ip: "127.0.0.1".to_string(),
+            run_failures: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -127,6 +134,16 @@ impl FakeRuntime {
         self.runs.lock().map(|g| *g).map_err(|_| RuntimeError::Lock)
     }
 
+    /// Make every launch of `image` fail with `message`, the way a bad image
+    /// reference does on a real runtime.
+    pub fn fail_image(&self, image: &str, message: &str) -> Result<(), RuntimeError> {
+        self.run_failures
+            .lock()
+            .map_err(|_| RuntimeError::Lock)?
+            .insert(image.to_string(), message.to_string());
+        Ok(())
+    }
+
     /// Simulate the instance for `uid` exiting with `exit_code`.
     pub fn set_exited(&self, uid: &str, exit_code: i32) -> Result<(), RuntimeError> {
         let mut g = self.instances.lock().map_err(|_| RuntimeError::Lock)?;
@@ -140,6 +157,14 @@ impl FakeRuntime {
 #[async_trait]
 impl ContainerRuntime for FakeRuntime {
     async fn run(&self, spec: &RunSpec) -> Result<InstanceId, RuntimeError> {
+        if let Some(message) = self
+            .run_failures
+            .lock()
+            .map_err(|_| RuntimeError::Lock)?
+            .get(&spec.image)
+        {
+            return Err(RuntimeError::Command(message.clone()));
+        }
         let id = InstanceId(format!("fake-{}", spec.uid));
         *self.runs.lock().map_err(|_| RuntimeError::Lock)? += 1;
         let mut g = self.instances.lock().map_err(|_| RuntimeError::Lock)?;
@@ -308,9 +333,16 @@ impl AppleContainer {
             .await
             .map_err(|e| RuntimeError::Io(e.to_string()))?;
         if !out.status.success() {
-            return Err(RuntimeError::Command(
-                String::from_utf8_lossy(&out.stderr).trim().to_string(),
-            ));
+            // A silent failure is the common case for `container run` against an
+            // image that is not a runnable image at all. Reporting the exit
+            // status rather than an empty string keeps the error from arriving
+            // as `runtime command failed: `, which names no cause whatsoever.
+            let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            return Err(RuntimeError::Command(if stderr.is_empty() {
+                format!("`{} {}` {}", self.bin, args.join(" "), out.status)
+            } else {
+                stderr
+            }));
         }
         Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
     }
