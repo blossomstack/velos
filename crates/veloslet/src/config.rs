@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 
-use crate::daemon::WorkerConfig;
+use crate::daemon::{self, WorkerConfig};
 use crate::memory::Memory;
 
 /// What `config show` prints in place of the credential. Deliberately not a
@@ -44,6 +44,97 @@ pub fn load(path: &Path) -> Result<WorkerConfig> {
         Err(e) => return Err(e).with_context(|| format!("reading config {}", path.display())),
     };
     serde_json::from_str(&text).with_context(|| format!("parsing config {}", path.display()))
+}
+
+/// The existing config, or `None` when nothing has been written yet.
+///
+/// A file that exists but cannot be parsed is an **error**, not `None`: treating
+/// it as absent would let `setup` quietly overwrite whatever is there, which is
+/// the one file holding this worker's identity.
+pub fn load_if_present(path: &Path) -> Result<Option<WorkerConfig>> {
+    match fs::read_to_string(path) {
+        Ok(text) => {
+            let cfg = serde_json::from_str(&text).with_context(|| {
+                format!(
+                    "parsing config {} — fix it by hand, or delete it to start over",
+                    path.display()
+                )
+            })?;
+            Ok(Some(cfg))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e).with_context(|| format!("reading config {}", path.display())),
+    }
+}
+
+/// Build the config `setup` should join with: the flags given, falling back to
+/// whatever an existing config already holds, then to the interval defaults.
+///
+/// This is why `setup` on a machine that has joined before needs only a fresh
+/// `--token`. It also means the interval fields cannot be given clap defaults —
+/// a default is indistinguishable from an explicit flag at this layer, so
+/// `setup --token …` would silently reset a tuned `lease_secs` back to 40.
+///
+/// The credential is never carried over: `setup` exists to earn a new one, and
+/// the caller writes nothing unless it does.
+pub fn resolve_setup(fields: Edits, existing: Option<WorkerConfig>) -> Result<WorkerConfig> {
+    let missing: Vec<&str> = [
+        ("--server", fields.server.is_some()),
+        ("--node", fields.node.is_some()),
+        ("--cpu", fields.cpu.is_some()),
+        ("--memory", fields.memory.is_some()),
+    ]
+    .iter()
+    .filter(|(_, given)| !given)
+    .map(|(name, _)| *name)
+    .collect();
+
+    // Nothing to inherit from, so report every missing flag at once rather than
+    // making the user rerun to discover them one at a time.
+    if existing.is_none() && !missing.is_empty() {
+        bail!(
+            "no existing config to take settings from, so {} {} required",
+            missing.join(", "),
+            if missing.len() == 1 { "is" } else { "are" }
+        );
+    }
+
+    // Each required field is flag → existing config → error. The error arm is
+    // unreachable after the check above, but writing it out beats a `default()`
+    // that would quietly invent a server URL or a capacity of zero if the two
+    // ever drifted apart.
+    let required = |name: &str| anyhow::anyhow!("{name} is required");
+    Ok(WorkerConfig {
+        server: fields
+            .server
+            .or_else(|| existing.as_ref().map(|b| b.server.clone()))
+            .ok_or_else(|| required("--server"))?,
+        node: fields
+            .node
+            .or_else(|| existing.as_ref().map(|b| b.node.clone()))
+            .ok_or_else(|| required("--node"))?,
+        credential: None,
+        cpu: fields
+            .cpu
+            .or_else(|| existing.as_ref().map(|b| b.cpu))
+            .ok_or_else(|| required("--cpu"))?,
+        memory: fields
+            .memory
+            .or_else(|| existing.as_ref().map(|b| b.memory))
+            .ok_or_else(|| required("--memory"))?,
+        reconcile_secs: fields
+            .reconcile_secs
+            .or_else(|| existing.as_ref().map(|b| b.reconcile_secs))
+            .unwrap_or(daemon::DEFAULT_RECONCILE_SECS),
+        heartbeat_secs: fields
+            .heartbeat_secs
+            .or_else(|| existing.as_ref().map(|b| b.heartbeat_secs))
+            .unwrap_or(daemon::DEFAULT_HEARTBEAT_SECS),
+        lease_secs: fields
+            .lease_secs
+            .or_else(|| existing.as_ref().map(|b| b.lease_secs))
+            .unwrap_or(daemon::DEFAULT_LEASE_SECS),
+    })
 }
 
 /// Persist the config as `0600` inside a `0700` directory.
@@ -275,6 +366,122 @@ mod tests {
             assert_eq!(field.read(&updated), want, "{field:?}");
         }
         assert_eq!(edits.touched().len(), expected.len());
+    }
+
+    #[test]
+    fn setup_takes_every_unset_field_from_the_existing_config() {
+        // The whole point: a machine that has joined before needs only a token.
+        let existing = base().with_credential("node-a.secret".to_string());
+        let resolved = resolve_setup(Edits::default(), Some(existing.clone())).unwrap();
+        assert_eq!(resolved.server, existing.server);
+        assert_eq!(resolved.node, existing.node);
+        assert_eq!(resolved.cpu, existing.cpu);
+        assert_eq!(resolved.memory, existing.memory);
+    }
+
+    #[test]
+    fn setup_does_not_reset_tuned_intervals() {
+        // The trap that made the interval flags Option rather than clap
+        // defaults: with `default_value_t`, a bare `setup --token …` would look
+        // identical to `--lease-secs 40` here and silently undo the tuning.
+        let tuned = WorkerConfig {
+            reconcile_secs: 30,
+            heartbeat_secs: 60,
+            lease_secs: 180,
+            ..base()
+        };
+        let resolved = resolve_setup(Edits::default(), Some(tuned)).unwrap();
+        assert_eq!(resolved.reconcile_secs, 30);
+        assert_eq!(resolved.heartbeat_secs, 60);
+        assert_eq!(resolved.lease_secs, 180);
+    }
+
+    #[test]
+    fn setup_flags_win_over_the_existing_config() {
+        let resolved = resolve_setup(
+            Edits {
+                cpu: Some(16),
+                server: Some("http://new:1".to_string()),
+                ..Default::default()
+            },
+            Some(base()),
+        )
+        .unwrap();
+        assert_eq!(resolved.cpu, 16);
+        assert_eq!(resolved.server, "http://new:1");
+        // Untouched fields still come from the file.
+        assert_eq!(resolved.node, base().node);
+        assert_eq!(resolved.memory, base().memory);
+    }
+
+    #[test]
+    fn setup_never_carries_the_old_credential_forward() {
+        // `setup` exists to earn a new one; carrying the old one would let a
+        // failed join look like a successful re-join.
+        let existing = base().with_credential("node-a.secret".to_string());
+        let resolved = resolve_setup(Edits::default(), Some(existing)).unwrap();
+        assert_eq!(resolved.credential, None);
+    }
+
+    #[test]
+    fn setup_without_a_config_names_every_missing_flag_at_once() {
+        let err = resolve_setup(
+            Edits {
+                server: Some("http://h:1".to_string()),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap_err()
+        .to_string();
+        for flag in ["--node", "--cpu", "--memory"] {
+            assert!(err.contains(flag), "{flag} missing from: {err}");
+        }
+        assert!(!err.contains("--server"), "{err}");
+    }
+
+    #[test]
+    fn setup_without_a_config_uses_interval_defaults() {
+        let resolved = resolve_setup(
+            Edits {
+                server: Some("http://h:1".to_string()),
+                node: Some("n".to_string()),
+                cpu: Some(2),
+                memory: Some(Memory::from_bytes(1024)),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(resolved.reconcile_secs, daemon::DEFAULT_RECONCILE_SECS);
+        assert_eq!(resolved.heartbeat_secs, daemon::DEFAULT_HEARTBEAT_SECS);
+        assert_eq!(resolved.lease_secs, daemon::DEFAULT_LEASE_SECS);
+        assert_eq!(resolved.credential, None);
+    }
+
+    #[test]
+    fn setup_defaults_match_what_serde_applies_to_an_absent_field() {
+        // Two sources of truth for the same default would drift silently.
+        let from_serde: WorkerConfig =
+            serde_json::from_str(r#"{"server":"http://h:1","node":"n","cpu":1,"memory":"1K"}"#)
+                .unwrap();
+        assert_eq!(from_serde.reconcile_secs, daemon::DEFAULT_RECONCILE_SECS);
+        assert_eq!(from_serde.heartbeat_secs, daemon::DEFAULT_HEARTBEAT_SECS);
+        assert_eq!(from_serde.lease_secs, daemon::DEFAULT_LEASE_SECS);
+    }
+
+    #[test]
+    fn an_unparseable_config_is_an_error_not_a_fresh_start() {
+        // Treating it as absent would let `setup` overwrite the one file holding
+        // this worker's identity.
+        let dir = std::env::temp_dir().join(format!("veloslet-bad-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("veloslet.json");
+        fs::write(&path, "{ not json").unwrap();
+        let err = load_if_present(&path).unwrap_err().to_string();
+        assert!(err.contains("parsing config"), "{err}");
+        assert_eq!(load_if_present(&dir.join("absent.json")).unwrap(), None);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

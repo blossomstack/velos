@@ -1,7 +1,8 @@
-//! `veloslet doctor` — one command that answers "is this worker working, and if
+//! `veloslet status` — one command that answers "is this worker working, and if
 //! not, what do I fix?".
 //!
-//! Same shape as `velosctl doctor`, and deliberately a separate copy of the
+//! The worker-side counterpart of `velosctl doctor`, named for what it reports
+//! rather than for the CLI it mirrors. Deliberately a separate copy of the
 //! report scaffolding: the two tools check disjoint things (a CLI's saved login
 //! versus a worker's credential, capacity and launchd agent), and a shared crate
 //! for ~150 lines of presentation would couple the worker daemon to the CLI.
@@ -252,6 +253,9 @@ pub enum AgentState {
     /// A LaunchAgent is loaded under the *pre-rename* bundle id, which no
     /// current `stop`/`uninstall` will touch.
     StaleLabel(String),
+    /// The current agent **and** a stale one are both loaded: two workers, same
+    /// config, same node name, racing each other.
+    Duplicate(String),
 }
 
 // ---------------------------------------------------------------------------
@@ -405,6 +409,18 @@ fn check_agent(state: &AgentState) -> Check {
             "the LaunchAgent is macOS-only; run this worker under your own service manager",
         ),
         AgentState::Loaded => Check::pass("background", format!("launchd is running {BUNDLE_ID}")),
+        AgentState::Duplicate(stale) => Check::fail(
+            "background",
+            format!(
+                "two workers are loaded — {BUNDLE_ID} and {stale} — sharing one config \
+                 and one node name"
+            ),
+            format!(
+                "they reconcile against each other and delete each other's containers; \
+                 drop the old one with `launchctl unload \
+                 ~/Library/LaunchAgents/{stale}.plist && rm ~/Library/LaunchAgents/{stale}.plist`"
+            ),
+        ),
         AgentState::NotLoaded => Check::warn(
             "background",
             "no LaunchAgent loaded — this worker only runs while `veloslet run` is in a terminal",
@@ -524,12 +540,15 @@ fn observe_agent() -> AgentState {
         .filter_map(|line| line.split_whitespace().nth(2))
         .filter(|label| label.ends_with("velos-worker"))
         .collect();
-    if labels.contains(&BUNDLE_ID) {
-        return AgentState::Loaded;
-    }
-    match labels.first() {
-        Some(other) => AgentState::StaleLabel((*other).to_string()),
-        None => AgentState::NotLoaded,
+    let stale: Vec<&&str> = labels.iter().filter(|l| **l != BUNDLE_ID).collect();
+    match (labels.contains(&BUNDLE_ID), stale.first()) {
+        // The worst case, and not hypothetical: `run -d` loads the current
+        // label without touching one left by a pre-rename install, so both run
+        // the same binary against the same config under the same node name.
+        (true, Some(other)) => AgentState::Duplicate((**other).to_string()),
+        (true, None) => AgentState::Loaded,
+        (false, Some(other)) => AgentState::StaleLabel((**other).to_string()),
+        (false, None) => AgentState::NotLoaded,
     }
 }
 
@@ -755,6 +774,21 @@ mod tests {
             "io.github.zhxiaogg.velos-worker".to_string(),
         ));
         assert_eq!(check.status, Status::Warn);
+        assert!(check.detail.contains("zhxiaogg"), "{}", check.detail);
+        assert!(check.hint.unwrap().contains("launchctl unload"));
+    }
+
+    #[test]
+    fn two_loaded_agents_are_a_failure_not_a_pass() {
+        // Seen for real: `run -d` loaded the current label while a pre-rename
+        // agent was still loaded, so two workers shared one config and one node
+        // name and reaped each other's containers. Reporting a plain pass here
+        // hid an actively broken machine.
+        let check = check_agent(&AgentState::Duplicate(
+            "io.github.zhxiaogg.velos-worker".to_string(),
+        ));
+        assert_eq!(check.status, Status::Fail);
+        assert!(check.detail.contains("two workers"), "{}", check.detail);
         assert!(check.detail.contains("zhxiaogg"), "{}", check.detail);
         assert!(check.hint.unwrap().contains("launchctl unload"));
     }

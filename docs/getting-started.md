@@ -228,19 +228,30 @@ veloslet setup --server http://127.0.0.1:8080 --node "$(hostname -s)" --token "$
 veloslet run
 ```
 
-`veloslet setup` flags:
+`veloslet setup` flags. Only `--token` is always required: **every other setting
+falls back to the existing config**, so re-joining a machine that has been set up
+before is just
+
+```bash
+veloslet setup --token "$TOKEN"
+```
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--server` | *(required)* | control-plane base URL |
-| `--node` | *(required)* | this worker's unique name |
 | `--token` | *(required)* | join token, traded for a credential here and never written to disk |
-| `--cpu` | *(required)* | advertised CPU cores; must not exceed the machine's |
-| `--memory` | *(required)* | advertised memory, e.g. `16G`; must not exceed the machine's |
-| `--reconcile-secs` | `5` | how often it reconciles its containers |
-| `--heartbeat-secs` | `10` | how often it renews its lease |
-| `--lease-secs` | `40` | lease duration; not renewed in time → worker goes `NotReady` |
-| `--config` | `~/.velos/veloslet.json` | where to write the config |
+| `--server` | existing config | control-plane base URL |
+| `--node` | existing config | this worker's unique name |
+| `--cpu` | existing config | advertised CPU cores; must not exceed the machine's |
+| `--memory` | existing config | advertised memory, e.g. `16G`; must not exceed the machine's |
+| `--reconcile-secs` | existing config, else `5` | how often it reconciles its containers |
+| `--heartbeat-secs` | existing config, else `10` | how often it renews its lease |
+| `--lease-secs` | existing config, else `40` | lease duration; not renewed in time → worker goes `NotReady` |
+| `--config` | `~/.velos/veloslet.json` | which config to read and write |
+
+The four settings above the intervals are required only when there is no config
+yet, and a first run reports all the missing ones at once rather than one per
+attempt. A config file that exists but cannot be parsed is an error rather than
+a fresh start, so `setup` never silently overwrites a file it could not read.
 
 Nothing is written unless the join succeeds, so a failed `setup` leaves the
 machine exactly as it was — there is no half-joined config for `run` to puzzle
@@ -274,13 +285,14 @@ looking at the terminal rather than at the next restart.
 
 Restart the worker for a change to take effect.
 
-### Check a worker with `veloslet doctor`
+### Check a worker with `veloslet status`
 
 ```bash
-veloslet doctor
+veloslet status
 ```
 
-The worker-side counterpart of `velosctl doctor`. It reports the `veloslet`
+The worker-side counterpart of `velosctl doctor`, named for what it reports. It
+gives the `veloslet`
 version and path; the config file and its permissions; whether this worker has
 joined; the server URL and whether it answers; whether the server still accepts
 this worker's credential **and agrees on its name**; advertised capacity against
@@ -289,7 +301,7 @@ running the background worker. Every line that isn't a pass carries the command
 that fixes it.
 
 ```
-  ✔ veloslet     v0.2.0 (/Users/you/.local/bin/veloslet)
+  ✔ veloslet     v0.3.0 (/Users/you/.local/bin/veloslet)
   ✔ config file  /Users/you/.velos/veloslet.json
   ✔ joined       holds a credential for macmini-2
   ✔ server       http://127.0.0.1:8080
@@ -494,7 +506,7 @@ Auth endpoints at a glance:
 
 ## 10. Troubleshooting
 
-Start with **`velosctl doctor`** (§4), or **`veloslet doctor`** on a worker machine — it names the broken layer and the command
+Start with **`velosctl doctor`** (§4), or **`veloslet status`** on a worker machine — it names the broken layer and the command
 that fixes it. The table below covers the rest.
 
 | Symptom | Likely cause / fix |

@@ -24,7 +24,6 @@ use velos_runtime::{AppleContainer, ContainerRuntime};
 use veloslet::config::{self, Edits, Field};
 use veloslet::daemon::{self, BUNDLE_EXECUTABLE, BUNDLE_ID, Bearer, WorkerConfig};
 use veloslet::host::{detect_host, detect_system_info, validate_capacity};
-use veloslet::memory::Memory;
 use veloslet::{ApiClient, run_loop};
 
 mod signing;
@@ -56,9 +55,10 @@ enum Command {
     /// Remove the background worker for good: LaunchAgent, app bundle, and the
     /// config with its credential.
     Uninstall(PathArgs),
-    /// Check this worker's setup and the control plane, and report what to fix.
-    /// Exits non-zero if anything is broken.
-    Doctor(PathArgs),
+    /// Report this worker's health — config, credential, control plane,
+    /// capacity, runtime and background agent. Exits non-zero if anything is
+    /// broken.
+    Status(PathArgs),
 }
 
 #[derive(Subcommand, Debug)]
@@ -103,31 +103,15 @@ impl PathArgs {
 
 #[derive(clap::Args, Debug)]
 struct SetupArgs {
-    /// server base URL, e.g. http://192.168.68.60:8088
-    #[arg(long)]
-    server: String,
-    /// This worker's name.
-    #[arg(long)]
-    node: String,
     /// Join token (`id.secret`), e.g. from `velosctl token create`. Traded for a
     /// worker credential here and never written to disk.
     #[arg(long)]
     token: String,
-    /// Advertised CPU cores.
-    #[arg(long)]
-    cpu: u32,
-    /// Advertised memory, e.g. 8G.
-    #[arg(long)]
-    memory: Memory,
-    /// Reconcile interval in seconds.
-    #[arg(long, default_value_t = 5)]
-    reconcile_secs: u64,
-    /// Heartbeat (lease renew) interval in seconds.
-    #[arg(long, default_value_t = 10)]
-    heartbeat_secs: u64,
-    /// Lease duration in seconds.
-    #[arg(long, default_value_t = 40)]
-    lease_secs: u32,
+    /// Settings for this worker. Each falls back to the existing config, so a
+    /// machine that has joined before needs only a fresh `--token`; they are
+    /// required only when there is no config yet.
+    #[command(flatten)]
+    fields: Edits,
     #[command(flatten)]
     path: PathArgs,
 }
@@ -197,20 +181,15 @@ fn path_str(p: &Path) -> Result<&str> {
 async fn setup(args: SetupArgs) -> Result<()> {
     let path = args.path.resolve()?;
 
+    // Flags win, the existing config fills the rest. Re-joining an already
+    // configured machine is then just `veloslet setup --token <new token>`.
+    let existing = config::load_if_present(&path)?;
+    let rejoin = existing.as_ref().map(|c| c.node.clone());
+    let cfg = config::resolve_setup(args.fields, existing)?;
+
     // Reject impossible capacity before touching the network (Principle #6).
     let host = detect_host()?;
-    validate_capacity(args.cpu, args.memory, host)?;
-
-    let cfg = WorkerConfig {
-        server: args.server,
-        node: args.node,
-        credential: None,
-        cpu: args.cpu,
-        memory: args.memory,
-        reconcile_secs: args.reconcile_secs,
-        heartbeat_secs: args.heartbeat_secs,
-        lease_secs: args.lease_secs,
-    };
+    validate_capacity(cfg.cpu, cfg.memory, host)?;
 
     let runtime = AppleContainer::new();
     let runtime_version = runtime
@@ -229,7 +208,16 @@ async fn setup(args: SetupArgs) -> Result<()> {
     let joined = cfg.with_credential(credential);
     config::save(&path, &joined)?;
 
-    println!("joined {} as {}", joined.server, joined.node);
+    match rejoin {
+        Some(previous) if previous == joined.node => {
+            println!("re-joined {} as {}", joined.server, joined.node)
+        }
+        Some(previous) => println!(
+            "joined {} as {} (was {previous})",
+            joined.server, joined.node
+        ),
+        None => println!("joined {} as {}", joined.server, joined.node),
+    }
     println!("  config:  {}", path.display());
     println!("  advertising {} cpu, {} memory", joined.cpu, joined.memory);
     println!(
@@ -348,12 +336,12 @@ async fn run(path: PathBuf) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// doctor
+// status
 // ---------------------------------------------------------------------------
 
-async fn doctor(config_path: PathBuf) -> Result<()> {
-    let report = veloslet::doctor::diagnose(config_path).await;
-    println!("veloslet doctor\n");
+async fn status(config_path: PathBuf) -> Result<()> {
+    let report = veloslet::status::diagnose(config_path).await;
+    println!("veloslet status\n");
     print!("{report}");
     if report.has_failures() {
         // A non-zero exit lets a script gate on a healthy worker; the report
@@ -568,7 +556,7 @@ async fn main() -> Result<()> {
                 run(path).await
             }
         }
-        Command::Doctor(path) => doctor(path.resolve()?).await,
+        Command::Status(path) => status(path.resolve()?).await,
         Command::Stop(path) => stop(path.resolve()?),
         Command::Uninstall(path) => uninstall(path.resolve()?),
     }

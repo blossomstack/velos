@@ -32,14 +32,20 @@ pub const BUNDLE_DISPLAY_NAME: &str = "Veloslet Worker";
 /// The executable name inside the app bundle (`Velos.app/Contents/MacOS/<name>`).
 pub const BUNDLE_EXECUTABLE: &str = "veloslet";
 
+/// Interval defaults, public so `setup` can fall back to the same values serde
+/// applies when a field is absent — two copies of these would drift.
+pub const DEFAULT_RECONCILE_SECS: u64 = 5;
+pub const DEFAULT_HEARTBEAT_SECS: u64 = 10;
+pub const DEFAULT_LEASE_SECS: u32 = 40;
+
 fn default_reconcile_secs() -> u64 {
-    5
+    DEFAULT_RECONCILE_SECS
 }
 fn default_heartbeat_secs() -> u64 {
-    10
+    DEFAULT_HEARTBEAT_SECS
 }
 fn default_lease_secs() -> u32 {
-    40
+    DEFAULT_LEASE_SECS
 }
 
 /// The secret a worker presents when it registers.
