@@ -45,19 +45,19 @@ curl -fsSL https://raw.githubusercontent.com/blossomstack/velos/main/install.sh 
 ```
 
 This picks the release build for your platform (macOS or Linux, arm64 or x86_64),
-verifies it against its published SHA-256, and installs `velosctl` into
-`~/.local/bin`. It prints an `export PATH=…` line if that directory isn't on your
-`PATH` yet. To pass options through the pipe, add `-s --`:
+verifies it against its published SHA-256, and installs `velosctl` and `veloslet`
+into `~/.local/bin`. It prints an `export PATH=…` line if that directory isn't on
+your `PATH` yet. To pass options through the pipe, add `-s --`:
 
 ```bash
-# control plane + CLI + worker agent, installed system-wide
+# add the control plane too, installed system-wide
 curl -fsSL https://raw.githubusercontent.com/blossomstack/velos/main/install.sh \
   | sh -s -- --components all --bin-dir /usr/local/bin
 ```
 
 | Option | Env | Default | Meaning |
 |---|---|---|---|
-| `--components` | `VELOS_COMPONENTS` | `velosctl` | comma-separated `velosctl`, `veloslet`, `velos-server`, or `all` |
+| `--components` | `VELOS_COMPONENTS` | `velosctl,veloslet` | comma-separated `velosctl`, `veloslet`, `velos-server`, or `all` |
 | `--bin-dir` | `VELOS_BIN_DIR` | `~/.local/bin` | where to install |
 | `--version` | `VELOS_VERSION` | latest release | release tag, e.g. `v0.1.3` |
 

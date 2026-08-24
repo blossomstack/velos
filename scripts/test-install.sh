@@ -89,6 +89,16 @@ VELOS_DOWNLOAD_BASE="$base" HOME="$home" sh "$root/install.sh" \
 [ -x "$home/.local/bin/velosctl" ] || fail "the default bin dir is not ~/.local/bin"
 pass "installs into ~/.local/bin by default"
 
+# The default component set is a user-visible promise too: a machine that runs
+# `install.sh` with no flags must end up able to both drive the control plane
+# (velosctl) and join it as a worker (veloslet) -- but must not silently gain a
+# control plane of its own (velos-server).
+[ -x "$home/.local/bin/veloslet" ] || fail "veloslet is not installed by default"
+if [ -e "$home/.local/bin/velos-server" ]; then
+    fail "velos-server was installed by default but is not in the default set"
+fi
+pass "installs velosctl and veloslet by default"
+
 # --- a binary that cannot run here must be rejected ------------------------
 
 broken="v9.9.8"
@@ -100,8 +110,11 @@ chmod +x "$work/broken-stage/velosctl"
 tar -czf "$broken_assets/$broken_tarball" -C "$work/broken-stage" velosctl
 write_sha "$broken_assets" "$broken_tarball"
 
+# Pinned to velosctl: this case is about a binary that will not execute, and
+# the fake release deliberately ships only that one component.
 if VELOS_DOWNLOAD_BASE="$base" sh "$root/install.sh" \
-    --version "$broken" --bin-dir "$work/bin-broken" >"$work/broken.log" 2>&1; then
+    --version "$broken" --bin-dir "$work/bin-broken" --components velosctl \
+    >"$work/broken.log" 2>&1; then
     fail "install accepted a binary that does not run on this machine"
 fi
 grep -q "did not run here" "$work/broken.log" \

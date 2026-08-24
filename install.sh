@@ -18,7 +18,7 @@ set -eu
 
 REPO="blossomstack/velos"
 KNOWN_COMPONENTS="velosctl veloslet velos-server"
-DEFAULT_COMPONENTS="velosctl"
+DEFAULT_COMPONENTS="velosctl veloslet"
 DEFAULT_BIN_DIR="${HOME}/.local/bin"
 
 version="${VELOS_VERSION:-}"
@@ -38,7 +38,7 @@ Usage: install.sh [options]
 
 Options:
   --components <list>  comma-separated: velosctl, veloslet, velos-server,
-                       or all  (default: velosctl)
+                       or all  (default: velosctl,veloslet)
   --bin-dir <dir>      where to install  (default: ~/.local/bin)
   --version <tag>      release tag to install, e.g. v0.1.3  (default: latest)
   -h, --help           show this help
