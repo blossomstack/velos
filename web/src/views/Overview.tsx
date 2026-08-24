@@ -4,8 +4,19 @@ import { Bar, Card } from "../ui";
 import { fmtBytes, isWorkerReady, phaseOf, PHASE_STYLES } from "../format";
 import type { ContainerPhase } from "../types";
 
-const ACTIVE: ContainerPhase[] = ["Scheduled", "Running"];
-const ORDER: ContainerPhase[] = ["Running", "Pending", "Scheduled", "Succeeded", "Failed", "Unknown"];
+// Phases that hold a share of a worker's capacity. `Hibernated` counts: the
+// micro-VM is down but its slot stays reserved, and this bar has to agree with
+// what the scheduler believes is committed.
+const ACTIVE: ContainerPhase[] = ["Scheduled", "Running", "Hibernated"];
+const ORDER: ContainerPhase[] = [
+  "Running",
+  "Pending",
+  "Scheduled",
+  "Hibernated",
+  "Succeeded",
+  "Failed",
+  "Unknown",
+];
 
 export function Overview() {
   const { data: workers = [] } = useWorkers();

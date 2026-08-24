@@ -235,6 +235,10 @@ cat > job.json <<'JSON'
 JSON
 velosctl apply container --file job.json
 
+# Suspend / wake (see §8)
+velosctl hibernate my-job
+velosctl resume my-job
+
 # Delete
 velosctl delete container my-job
 ```
@@ -275,6 +279,23 @@ cd web && npm install && npm run dev      # http://localhost:5173
    and reports its ID.
 4. **`Succeeded` / `Failed`** — when the process exits (0 vs non-zero); the
    `restartPolicy` (`Never` / `OnFailure` / `Always`) decides whether it restarts.
+
+**`Hibernated`** sits outside that line. Hibernating shuts the micro-VM down
+while keeping the container object, its worker binding, its disk, and its slice
+of that worker's capacity:
+
+```bash
+velosctl hibernate my-job     # POST /api/v1/containers/my-job/hibernate
+velosctl resume    my-job     # POST /api/v1/containers/my-job/resume
+```
+
+Both are declarative: they set `spec.desiredState` (`Running` | `Hibernated`) and
+the owning `veloslet` converges the micro-VM on its next pass, then reports
+`status.phase`. So the phase lags the call by a reconcile interval — poll until
+it reads `Hibernated`. Repeat calls are no-ops, `resume` boots the *same*
+instance back up (its disk survives), and a container that has already finished
+cannot be hibernated (`409`). A hibernated container keeps its reservation, so
+waking it never has to compete for its worker's capacity.
 
 If a worker's lease goes stale, the health controller marks it `NotReady`; after
 a grace period its containers are evicted (rescheduled if labeled

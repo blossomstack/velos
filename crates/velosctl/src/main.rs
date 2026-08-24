@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use serde_json::Value;
-use velosctl::{collection_url, object_url, plural_for};
+use velosctl::{collection_url, object_url, plural_for, subresource_url};
 
 /// A thin CLI over the Velos REST API.
 #[derive(Parser, Debug)]
@@ -31,6 +31,10 @@ enum Command {
     },
     /// Delete a resource by name.
     Delete { kind: String, name: String },
+    /// Shut a container down temporarily, keeping the object and its disk.
+    Hibernate { name: String },
+    /// Wake a hibernated container back up.
+    Resume { name: String },
     /// Create a resource from a JSON file.
     Apply {
         kind: String,
@@ -124,6 +128,16 @@ async fn main() -> Result<()> {
                 bail!("delete failed: {status}");
             }
             println!("{kind}/{name} deleted");
+        }
+        Command::Hibernate { name } => {
+            let url = subresource_url(&server, "containers", &name, "hibernate");
+            let resp = client(&token, http.post(url)).send().await?;
+            print_json(&body_or_error(resp).await?)?;
+        }
+        Command::Resume { name } => {
+            let url = subresource_url(&server, "containers", &name, "resume");
+            let resp = client(&token, http.post(url)).send().await?;
+            print_json(&body_or_error(resp).await?)?;
         }
         Command::Apply { kind, file } => {
             let plural = plural_for(&kind).with_context(|| format!("unknown kind: {kind}"))?;

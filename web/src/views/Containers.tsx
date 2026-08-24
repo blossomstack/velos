@@ -1,17 +1,33 @@
 import { useMemo, useState } from "react";
-import { Box, Plus, Trash2 } from "lucide-react";
-import { useContainers, useDeleteContainer } from "../api";
+import { Box, Moon, Play, Plus, Trash2 } from "lucide-react";
+import { useContainers, useDeleteContainer, useHibernateContainer, useResumeContainer } from "../api";
 import { Card, EmptyState, Labels, PhaseBadge, Spinner } from "../ui";
 import { Drawer, Field, Json } from "../components/Drawer";
 import { CreateContainer } from "../components/CreateContainer";
 import { ageFrom, fmtBytes, phaseOf } from "../format";
 import type { Container, ContainerPhase } from "../types";
 
-const FILTERS: (ContainerPhase | "All")[] = ["All", "Running", "Pending", "Scheduled", "Succeeded", "Failed"];
+const FILTERS: (ContainerPhase | "All")[] = [
+  "All",
+  "Running",
+  "Pending",
+  "Scheduled",
+  "Hibernated",
+  "Succeeded",
+  "Failed",
+];
+
+/// Hibernating only makes sense for a container that hasn't finished — the
+/// server rejects the rest with a 409, so don't offer the action there.
+function canHibernate(phase: ContainerPhase): boolean {
+  return phase !== "Succeeded" && phase !== "Failed" && phase !== "Hibernated";
+}
 
 export function Containers() {
   const { data: containers, isLoading } = useContainers();
   const del = useDeleteContainer();
+  const hibernate = useHibernateContainer();
+  const resume = useResumeContainer();
   const [filter, setFilter] = useState<ContainerPhase | "All">("All");
   const [selected, setSelected] = useState<Container | null>(null);
   const [creating, setCreating] = useState(false);
@@ -91,6 +107,31 @@ export function Containers() {
                   </td>
                   <td className="px-5 py-3 text-zinc-500">{ageFrom(c.metadata.creationTimestamp)}</td>
                   <td className="px-5 py-3 text-right">
+                    {phaseOf(c) === "Hibernated" ? (
+                      <button
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          resume.mutate(c.metadata.name);
+                        }}
+                        className="rounded-md p-1.5 text-zinc-500 hover:bg-emerald-500/10 hover:text-emerald-400"
+                        title="Resume"
+                      >
+                        <Play size={15} />
+                      </button>
+                    ) : (
+                      canHibernate(phaseOf(c)) && (
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            hibernate.mutate(c.metadata.name);
+                          }}
+                          className="rounded-md p-1.5 text-zinc-500 hover:bg-violet-500/10 hover:text-violet-400"
+                          title="Hibernate"
+                        >
+                          <Moon size={15} />
+                        </button>
+                      )
+                    )}
                     <button
                       onClick={(e) => {
                         e.stopPropagation();
@@ -134,6 +175,7 @@ function ContainerDrawer({ container, onClose }: { container: Container | null; 
         </Field>
         <Field label="Node">{container.spec.nodeName ?? "unscheduled"}</Field>
         <Field label="Restart policy">{container.spec.restartPolicy ?? "Never"}</Field>
+        <Field label="Desired state">{container.spec.desiredState ?? "Running"}</Field>
         <Field label="Resources">
           {container.spec.resources?.cpu ?? 1} cores · {fmtBytes(container.spec.resources?.memoryBytes)}
         </Field>
@@ -141,6 +183,7 @@ function ContainerDrawer({ container, onClose }: { container: Container | null; 
           <span className="font-mono text-xs">{s.containerID ?? "—"}</span>
         </Field>
         <Field label="Started">{s.startedAt ? `${ageFrom(s.startedAt)} ago` : "—"}</Field>
+        <Field label="Hibernated">{s.hibernatedAt ? `${ageFrom(s.hibernatedAt)} ago` : "—"}</Field>
         <Field label="Finished">{s.finishedAt ? `${ageFrom(s.finishedAt)} ago` : "—"}</Field>
         <Field label="Exit code">{s.exitCode ?? "—"}</Field>
         {s.message && <Field label="Message">{s.message}</Field>}

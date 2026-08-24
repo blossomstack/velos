@@ -286,14 +286,24 @@ fn pending_containers(containers: &[StoredObject]) -> Vec<PendingContainer> {
         .collect()
 }
 
+/// Phases in which a container still holds its worker's resources.
+///
+/// `Hibernated` counts: the micro-VM is shut down but its disk stays on that
+/// worker, and waking it must not fail because the slot was given away in the
+/// meantime. Hibernating frees the *machine*, not the reservation.
+fn holds_resources(doc: &Value) -> bool {
+    matches!(
+        phase(doc),
+        Some("Scheduled") | Some("Running") | Some("Hibernated")
+    )
+}
+
 /// Resources currently committed to a worker by containers bound to it.
 fn usage_for(containers: &[StoredObject], worker: &str) -> ResourceRequest {
     let mut cpu = 0;
     let mut mem = 0;
     for c in containers {
-        if c.node_name.as_deref() == Some(worker)
-            && matches!(phase(&c.document), Some("Scheduled") | Some("Running"))
-        {
+        if c.node_name.as_deref() == Some(worker) && holds_resources(&c.document) {
             let r = container_request(&c.document);
             cpu += r.cpu;
             mem += r.memory_bytes;
@@ -571,7 +581,9 @@ pub fn reconcile_node_lifecycle(
             if c.node_name.as_deref() != Some(w.name.as_str()) {
                 continue;
             }
-            if !matches!(phase(&c.document), Some("Scheduled") | Some("Running")) {
+            // Hibernated containers are evicted too: their disk lived on the
+            // dead worker, so staying bound to it would leave them unwakeable.
+            if !holds_resources(&c.document) {
                 continue;
             }
             let reschedulable = label(&c.document, RESCHEDULABLE_LABEL).as_deref() == Some("true");
@@ -732,6 +744,16 @@ mod tests {
         let out = plan_bindings(&pending, &views);
         assert!(matches!(out.as_slice(),
             [PlacementOutcome::Bind(b)] if b.worker == "w1"));
+    }
+
+    #[test]
+    fn hibernated_container_keeps_holding_its_workers_resources() {
+        // Waking must be guaranteed a slot, so the reservation outlives the
+        // running micro-VM — otherwise a resume could find the worker full.
+        let c = container_obj("c1", "Hibernated", Some("w1"));
+        let used = usage_for(std::slice::from_ref(&c), "w1");
+        assert_eq!(used.cpu, 1);
+        assert_eq!(used.memory_bytes, 1024);
     }
 
     #[test]

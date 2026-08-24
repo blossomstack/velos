@@ -117,6 +117,36 @@ fn extract_node_name(doc: &Value) -> Option<String> {
         .map(str::to_string)
 }
 
+/// `spec.desiredState` values, mirroring `velos::DesiredState`.
+const DESIRED_RUNNING: &str = "Running";
+const DESIRED_HIBERNATED: &str = "Hibernated";
+
+/// Admission for `spec.desiredState`: reject anything outside the enum, and
+/// stamp the default on containers that omit it, so every stored document says
+/// out loud whether it is meant to be running. Fail closed — an unreadable
+/// intent must never reach the worker, which would read it as `Running`.
+fn normalize_desired_state(kind: &str, doc: &mut Value) -> Result<(), ApiError> {
+    if kind != "Container" {
+        return Ok(());
+    }
+    let Some(spec) = doc.get_mut("spec").and_then(Value::as_object_mut) else {
+        return Ok(());
+    };
+    match spec.get("desiredState") {
+        None | Some(Value::Null) => {
+            spec.insert(
+                "desiredState".to_string(),
+                serde_json::json!(DESIRED_RUNNING),
+            );
+            Ok(())
+        }
+        Some(Value::String(v)) if v == DESIRED_RUNNING || v == DESIRED_HIBERNATED => Ok(()),
+        Some(other) => Err(ApiError::BadRequest(format!(
+            "spec.desiredState must be \"{DESIRED_RUNNING}\" or \"{DESIRED_HIBERNATED}\", got {other}"
+        ))),
+    }
+}
+
 /// Admission (fail closed): reject malformed placement in a Container/Worker
 /// spec, rather than letting the scheduler silently skip the bad expression.
 fn validate_placement(kind: &str, doc: &Value) -> Result<(), ApiError> {
@@ -289,6 +319,7 @@ async fn create(
     let name =
         extract_name(&body).ok_or_else(|| ApiError::BadRequest("metadata.name required".into()))?;
     validate_placement(kind, &body)?;
+    normalize_desired_state(kind, &mut body)?;
     let uid = Uuid::new_v4();
     let rv = state.store.next_resource_version()?;
     stamp_meta(&mut body, &uid, rv);
@@ -414,6 +445,7 @@ async fn replace(
         return Err(ApiError::BadRequest("body must be a JSON object".into()));
     }
     validate_placement(kind, &body)?;
+    normalize_desired_state(kind, &mut body)?;
     // Capture the client's optimistic-concurrency precondition before re-stamping.
     let precondition = body
         .get("metadata")
@@ -495,6 +527,99 @@ async fn replace_status(
     existing.node_name = extract_node_name(&existing.document);
     state.store.put(&existing)?;
     Ok(Json(existing.document))
+}
+
+/// `POST /api/v1/containers/{name}/hibernate` — shut the container down
+/// temporarily, keeping the object, its binding, and its worker-side disk.
+///
+/// Hibernation is *declarative*: this only records the user's intent in
+/// `spec.desiredState`, and the owning worker converges the micro-VM on its next
+/// reconcile pass. Actuating the runtime from here instead would be undone by
+/// that same pass.
+async fn hibernate(
+    State(state): State<AppState>,
+    Path((plural, name)): Path<(String, String)>,
+) -> Result<Json<Value>, ApiError> {
+    set_desired_state(&state, &plural, &name, DESIRED_HIBERNATED)
+}
+
+/// `POST /api/v1/containers/{name}/resume` — wake a hibernated container.
+async fn resume(
+    State(state): State<AppState>,
+    Path((plural, name)): Path<(String, String)>,
+) -> Result<Json<Value>, ApiError> {
+    set_desired_state(&state, &plural, &name, DESIRED_RUNNING)
+}
+
+/// Write `spec.desiredState`, shared by both subresources. Idempotent: asking
+/// for the state a container is already in is a 200 with no write, so repeated
+/// calls don't churn the resource version and wake every watcher.
+fn set_desired_state(
+    state: &AppState,
+    plural: &str,
+    name: &str,
+    desired: &str,
+) -> Result<Json<Value>, ApiError> {
+    // Only containers have a run state; `workers/w1/hibernate` is not a thing.
+    match kind_for(plural) {
+        Some("Container") => {}
+        Some(_) | None => return Err(ApiError::NotFound),
+    }
+    let mut existing = state
+        .store
+        .get("Container", name)?
+        .ok_or(ApiError::NotFound)?;
+
+    // Fail closed: a container that already ran to completion has no run state
+    // left to change, and pretending otherwise would strand it asleep forever.
+    if desired == DESIRED_HIBERNATED
+        && let Some(phase) = str_at(&existing.document, &["status", "phase"])
+        && matches!(phase, "Succeeded" | "Failed")
+    {
+        return Err(ApiError::Conflict(format!(
+            "cannot hibernate container in phase {phase}"
+        )));
+    }
+
+    if str_at(&existing.document, &["spec", "desiredState"]) == Some(desired) {
+        return Ok(Json(existing.document));
+    }
+
+    let rv = state.store.next_resource_version()?;
+    if !existing
+        .document
+        .get("spec")
+        .map(Value::is_object)
+        .unwrap_or(false)
+    {
+        existing.document["spec"] = serde_json::json!({});
+    }
+    if let Some(spec) = existing
+        .document
+        .get_mut("spec")
+        .and_then(Value::as_object_mut)
+    {
+        spec.insert("desiredState".to_string(), serde_json::json!(desired));
+    }
+    if let Some(m) = existing
+        .document
+        .get_mut("metadata")
+        .and_then(Value::as_object_mut)
+    {
+        m.insert("resourceVersion".to_string(), serde_json::json!(rv));
+    }
+    existing.resource_version = rv;
+    state.store.put(&existing)?;
+    Ok(Json(existing.document))
+}
+
+/// Read a nested string field out of an opaque document.
+fn str_at<'a>(doc: &'a Value, path: &[&str]) -> Option<&'a str> {
+    let mut cur = doc;
+    for p in path {
+        cur = cur.get(p)?;
+    }
+    cur.as_str()
 }
 
 async fn delete(
@@ -906,6 +1031,8 @@ fn api_routes() -> Router<AppState> {
             get(get_one).put(replace).delete(delete),
         )
         .route("/api/v1/{plural}/{name}/status", put(replace_status))
+        .route("/api/v1/{plural}/{name}/hibernate", post(hibernate))
+        .route("/api/v1/{plural}/{name}/resume", post(resume))
 }
 
 // ---------------------------------------------------------------------------
@@ -1460,6 +1587,171 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// POST a subresource (`hibernate` / `resume`) and return the raw response.
+    async fn post_sub(
+        app: &axum::Router,
+        plural: &str,
+        name: &str,
+        sub: &str,
+    ) -> axum::response::Response {
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/v1/{plural}/{name}/{sub}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    async fn get_doc(app: &axum::Router, plural: &str, name: &str) -> serde_json::Value {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!("/api/v1/{plural}/{name}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        body_json(resp).await
+    }
+
+    #[tokio::test]
+    async fn create_stamps_the_default_desired_state() {
+        // Every stored container states its run intent, so no reader has to
+        // guess what an absent field meant.
+        let app = test_app();
+        post(
+            &app,
+            "containers",
+            serde_json::json!({ "metadata": { "name": "c1" }, "spec": { "image": "alpine" } }),
+        )
+        .await;
+        let got = get_doc(&app, "containers", "c1").await;
+        assert_eq!(got["spec"]["desiredState"], "Running");
+    }
+
+    #[tokio::test]
+    async fn create_rejects_an_unknown_desired_state() {
+        let app = test_app();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/containers")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "metadata": { "name": "c1" },
+                            "spec": { "image": "alpine", "desiredState": "asleep" }
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn hibernate_then_resume_round_trips_the_desired_state() {
+        let app = test_app();
+        post(
+            &app,
+            "containers",
+            serde_json::json!({
+                "metadata": { "name": "c1" },
+                "spec": { "image": "alpine" },
+                "status": { "phase": "Running", "workerName": "w1" }
+            }),
+        )
+        .await;
+
+        let resp = post_sub(&app, "containers", "c1", "hibernate").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let doc = body_json(resp).await;
+        assert_eq!(doc["spec"]["desiredState"], "Hibernated");
+        // Hibernating is not deleting: the object keeps its binding and phase
+        // until the owning worker reports the micro-VM actually went down.
+        assert_eq!(doc["status"]["workerName"], "w1");
+        assert_eq!(doc["status"]["phase"], "Running");
+
+        let resp = post_sub(&app, "containers", "c1", "resume").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            get_doc(&app, "containers", "c1").await["spec"]["desiredState"],
+            "Running"
+        );
+    }
+
+    #[tokio::test]
+    async fn hibernating_twice_is_a_no_op_that_does_not_bump_the_resource_version() {
+        // Repeated calls must not churn the resource version — every watcher in
+        // the cluster wakes on each bump.
+        let app = test_app();
+        post(
+            &app,
+            "containers",
+            serde_json::json!({ "metadata": { "name": "c1" }, "spec": { "image": "alpine" } }),
+        )
+        .await;
+        let first = body_json(post_sub(&app, "containers", "c1", "hibernate").await).await;
+        let second = body_json(post_sub(&app, "containers", "c1", "hibernate").await).await;
+        assert_eq!(
+            first["metadata"]["resourceVersion"],
+            second["metadata"]["resourceVersion"]
+        );
+    }
+
+    #[tokio::test]
+    async fn hibernating_a_finished_container_conflicts() {
+        let app = test_app();
+        post(
+            &app,
+            "containers",
+            serde_json::json!({
+                "metadata": { "name": "c1" },
+                "spec": { "image": "alpine" },
+                "status": { "phase": "Succeeded", "exitCode": 0 }
+            }),
+        )
+        .await;
+        let resp = post_sub(&app, "containers", "c1", "hibernate").await;
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            get_doc(&app, "containers", "c1").await["spec"]["desiredState"],
+            "Running"
+        );
+    }
+
+    #[tokio::test]
+    async fn only_containers_have_a_run_state() {
+        let app = test_app();
+        post(
+            &app,
+            "workers",
+            serde_json::json!({ "metadata": { "name": "w1" }, "spec": {} }),
+        )
+        .await;
+        assert_eq!(
+            post_sub(&app, "workers", "w1", "hibernate").await.status(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            post_sub(&app, "containers", "ghost", "resume")
+                .await
+                .status(),
+            StatusCode::NOT_FOUND
+        );
     }
 
     #[tokio::test]

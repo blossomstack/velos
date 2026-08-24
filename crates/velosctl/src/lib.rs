@@ -101,6 +101,11 @@ pub fn object_url(base: &str, plural: &str, name: &str) -> String {
     format!("{base}/api/v1/{plural}/{name}")
 }
 
+/// Build a subresource URL, e.g. `.../containers/c1/hibernate`.
+pub fn subresource_url(base: &str, plural: &str, name: &str, sub: &str) -> String {
+    format!("{}/{sub}", object_url(base, plural, name))
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -181,6 +186,14 @@ mod tests {
             assert_eq!(mode & 0o777, 0o600);
         }
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn subresource_url_appends_the_verb() {
+        assert_eq!(
+            subresource_url("http://h:8080/", "containers", "c1", "hibernate"),
+            "http://h:8080/api/v1/containers/c1/hibernate"
+        );
     }
 
     #[test]

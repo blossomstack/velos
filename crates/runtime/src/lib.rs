@@ -60,8 +60,15 @@ pub trait ContainerRuntime: Send + Sync {
     /// Launch an instance tagged with `spec.uid`. Idempotent callers check
     /// [`list`](ContainerRuntime::list) first.
     async fn run(&self, spec: &RunSpec) -> Result<InstanceId, RuntimeError>;
-    /// Stop the instance tagged with `uid` (no-op if already gone).
+    /// Shut the instance tagged with `uid` down, **keeping** it (and its disk)
+    /// so [`start`](ContainerRuntime::start) can bring it back. No-op if already
+    /// gone. Removal is a separate call — see [`remove`](ContainerRuntime::remove).
     async fn stop(&self, uid: &str) -> Result<(), RuntimeError>;
+    /// Boot a stopped instance tagged with `uid` back up, preserving its disk
+    /// state. Errors when the runtime has no such instance: waking a container
+    /// whose instance is gone means launching a fresh one, which is
+    /// [`run`](ContainerRuntime::run)'s job, not a silent fallback here.
+    async fn start(&self, uid: &str) -> Result<InstanceId, RuntimeError>;
     /// Remove the instance tagged with `uid` (no-op if already gone).
     async fn remove(&self, uid: &str) -> Result<(), RuntimeError>;
     /// All instances the runtime knows about, by uid.
@@ -79,11 +86,19 @@ pub trait ContainerRuntime: Send + Sync {
 #[derive(Default)]
 pub struct FakeRuntime {
     instances: Mutex<HashMap<String, Instance>>,
+    runs: Mutex<usize>,
 }
 
 impl FakeRuntime {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// How many times [`run`](ContainerRuntime::run) launched a *fresh*
+    /// instance. Lets a test tell "resumed the same micro-VM" apart from
+    /// "silently recreated it", which `list` alone cannot show.
+    pub fn run_count(&self) -> Result<usize, RuntimeError> {
+        self.runs.lock().map(|g| *g).map_err(|_| RuntimeError::Lock)
     }
 
     /// Simulate the instance for `uid` exiting with `exit_code`.
@@ -100,6 +115,7 @@ impl FakeRuntime {
 impl ContainerRuntime for FakeRuntime {
     async fn run(&self, spec: &RunSpec) -> Result<InstanceId, RuntimeError> {
         let id = InstanceId(format!("fake-{}", spec.uid));
+        *self.runs.lock().map_err(|_| RuntimeError::Lock)? += 1;
         let mut g = self.instances.lock().map_err(|_| RuntimeError::Lock)?;
         g.insert(
             spec.uid.clone(),
@@ -118,6 +134,17 @@ impl ContainerRuntime for FakeRuntime {
             inst.state = InstanceState::Exited { exit_code: 0 };
         }
         Ok(())
+    }
+
+    async fn start(&self, uid: &str) -> Result<InstanceId, RuntimeError> {
+        let mut g = self.instances.lock().map_err(|_| RuntimeError::Lock)?;
+        match g.get_mut(uid) {
+            Some(inst) => {
+                inst.state = InstanceState::Running;
+                Ok(inst.id.clone())
+            }
+            None => Err(RuntimeError::Command(format!("no such instance: {uid}"))),
+        }
     }
 
     async fn remove(&self, uid: &str) -> Result<(), RuntimeError> {
@@ -148,6 +175,7 @@ impl ContainerRuntime for FakeRuntime {
 //
 //   run     : `container run --detach --name velos-<uid> [--env K=V ...] [--entrypoint <cmd[0]>] <image> [cmd[1..]...]`
 //   stop    : `container stop velos-<uid>`
+//   start   : `container start velos-<uid>`
 //   remove  : `container delete --force velos-<uid>`
 //   list    : `container list --all --format json`
 //   version : `container --version`
@@ -155,9 +183,15 @@ impl ContainerRuntime for FakeRuntime {
 // These match the apple/container 1.0 command reference (`delete` has alias
 // `rm`, `list` has alias `ls`). If your installed version differs, this is the
 // one place to adjust.
+//
+// Hibernation relies on `run` **not** passing `--rm`: without it a stopped
+// container survives, keeps its disk, still appears in `list --all`, and
+// `start` boots it again. Adding `--rm` here would silently turn every
+// hibernate into a destroy.
 
 const SUBCMD_RUN: &str = "run";
 const SUBCMD_STOP: &str = "stop";
+const SUBCMD_START: &str = "start";
 const SUBCMD_REMOVE: &str = "delete";
 const SUBCMD_LIST: &str = "list";
 /// Prefix applied to a uid to form the runtime instance name.
@@ -265,6 +299,13 @@ impl ContainerRuntime for AppleContainer {
         Ok(())
     }
 
+    async fn start(&self, uid: &str) -> Result<InstanceId, RuntimeError> {
+        let name = instance_name(uid);
+        self.output(&[SUBCMD_START.to_string(), name.clone()])
+            .await?;
+        Ok(InstanceId(name))
+    }
+
     async fn remove(&self, uid: &str) -> Result<(), RuntimeError> {
         self.output_best_effort(&[
             SUBCMD_REMOVE.to_string(),
@@ -349,6 +390,9 @@ fn parse_list(raw: &str) -> Result<Vec<Instance>, RuntimeError> {
         let state = if running {
             InstanceState::Running
         } else {
+            // apple/container reports no exit code anywhere (see issue #28), so
+            // on that runtime this fallback makes every crash read as a clean
+            // exit. Other runtimes that do report one are picked up here.
             let exit_code = entry
                 .get("exitCode")
                 .or_else(|| entry.get("exit_code"))
@@ -393,6 +437,52 @@ mod tests {
 
         rt.remove("u1").await.unwrap();
         assert!(rt.list().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn fake_runtime_stop_keeps_the_instance_so_start_can_wake_it() {
+        // Hibernation is stop-then-start on the *same* instance: `stop` must not
+        // remove it, and `start` must not count as a fresh `run`.
+        let rt = FakeRuntime::new();
+        let id = rt.run(&spec("u1")).await.unwrap();
+
+        rt.stop("u1").await.unwrap();
+        let list = rt.list().await.unwrap();
+        assert_eq!(list.len(), 1, "stop must keep the instance");
+        assert_eq!(list[0].state, InstanceState::Exited { exit_code: 0 });
+
+        let woken = rt.start("u1").await.unwrap();
+        assert_eq!(woken, id, "start resumes the same instance");
+        assert_eq!(rt.list().await.unwrap()[0].state, InstanceState::Running);
+        assert_eq!(
+            rt.run_count().unwrap(),
+            1,
+            "start must not re-run the image"
+        );
+    }
+
+    #[tokio::test]
+    async fn fake_runtime_start_of_a_removed_instance_errors() {
+        // `start` never conjures an instance — a caller whose instance is gone
+        // has to `run` a fresh one, and must see that it is doing so.
+        let rt = FakeRuntime::new();
+        rt.run(&spec("u1")).await.unwrap();
+        rt.remove("u1").await.unwrap();
+        assert!(rt.start("u1").await.is_err());
+    }
+
+    #[test]
+    fn parse_list_reports_a_hibernated_instance_as_stopped_not_missing() {
+        // A hibernated micro-VM must still appear in `list --all`, or the worker
+        // would read it as gone and launch a fresh one instead of waking it.
+        // Shape captured from apple/container 1.0.0.
+        let raw = r#"[
+            {"id":"velos-u1","status":{"state":"stopped","startedDate":"2026-08-24T00:33:55Z"}}
+        ]"#;
+        let got = parse_list(raw).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].uid, "u1");
+        assert_eq!(got[0].state, InstanceState::Exited { exit_code: 0 });
     }
 
     #[test]

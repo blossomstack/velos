@@ -15,8 +15,8 @@ use chrono::Utc;
 use uuid::Uuid;
 
 use velos::{
-    Container, ContainerPhase, ContainerSpec, ContainerStatus, ObjectMeta, ResourceReqs,
-    RestartPolicy,
+    Container, ContainerPhase, ContainerSpec, ContainerStatus, DesiredState, ObjectMeta,
+    ResourceReqs, RestartPolicy,
 };
 
 impl ObjectMeta {
@@ -46,12 +46,22 @@ impl Container {
                 HashMap::new(),
                 ResourceReqs::new(1, 512 * 1024 * 1024),
                 RestartPolicy::Never,
+                DesiredState::Running,
                 None,           // node_name
                 HashMap::new(), // node_selector
                 None,           // affinity
                 Vec::new(),     // tolerations
             ),
-            ContainerStatus::new(ContainerPhase::Pending, None, None, None, None, None, None),
+            ContainerStatus::new(
+                ContainerPhase::Pending,
+                None, // worker_name
+                None, // container_id
+                None, // started_at
+                None, // hibernated_at
+                None, // finished_at
+                None, // exit_code
+                None, // message
+            ),
         )
     }
 }
@@ -69,6 +79,11 @@ mod tests {
         assert!(json.contains("\"resourceVersion\""), "json was: {json}");
         assert!(json.contains("\"creationTimestamp\""), "json was: {json}");
         assert!(json.contains("\"restartPolicy\""), "json was: {json}");
+        // The user's run intent is part of the spec, not the status.
+        assert!(
+            json.contains("\"desiredState\":\"Running\""),
+            "json was: {json}"
+        );
 
         let back: Container = serde_json::from_str(&json).unwrap();
         assert_eq!(c, back);

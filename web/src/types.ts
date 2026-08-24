@@ -17,11 +17,16 @@ export type ContainerPhase =
   | "Pending"
   | "Scheduled"
   | "Running"
+  | "Hibernated"
   | "Succeeded"
   | "Failed"
   | "Unknown";
 
 export type RestartPolicy = "Never" | "OnFailure" | "Always";
+
+/// The run state the user asked for (`spec.desiredState`), as opposed to the
+/// phase the worker observes (`status.phase`).
+export type DesiredState = "Running" | "Hibernated";
 
 export interface ResourceSpec {
   cpu?: number;
@@ -34,6 +39,7 @@ export interface ContainerSpec {
   env?: Record<string, string>;
   resources?: ResourceSpec;
   restartPolicy?: RestartPolicy;
+  desiredState?: DesiredState;
   nodeName?: string;
 }
 
@@ -42,6 +48,7 @@ export interface ContainerStatus {
   workerName?: string;
   containerID?: string;
   startedAt?: string;
+  hibernatedAt?: string;
   finishedAt?: string;
   exitCode?: number;
   message?: string;

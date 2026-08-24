@@ -4,7 +4,12 @@
 //! token mint, worker registration, the `veloslet` loop (lease heartbeat +
 //! reconcile) driving the actual `container` CLI, and a real micro-VM launched
 //! from a real image. It asserts the container goes Pending → Scheduled →
-//! Running → Succeeded, then exercises finalizer-based deletion.
+//! Running → Succeeded, then exercises finalizer-based deletion, and finally
+//! hibernates and wakes a long-running container on the real `container` CLI.
+//!
+//! It is deliberately **one** test function, not several: `AppleContainer::list`
+//! sees every `velos-*` instance on the host, so two `veloslet`s running in
+//! parallel would each reap the other's micro-VMs.
 //!
 //! This test is always enabled (no `#[ignore]`): on a host with a working Apple
 //! `container` CLI it runs for real end to end; everywhere else it **self-skips**
@@ -31,6 +36,47 @@ use veloslet::{ApiClient, run_loop};
 
 const NODE: &str = "worker-e2e";
 const IMAGE: &str = "docker.io/library/alpine:3";
+
+/// Ask the `container` CLI directly what state an instance is in.
+///
+/// Deliberately **not** routed through `AppleContainer::list`: that parser is
+/// part of what this test exercises. A parser that misread the state would
+/// otherwise make these assertions pass without a single micro-VM ever being
+/// shut down — which is exactly how the `status.state` bug in #8 survived a
+/// green e2e run.
+async fn cli_state(uid: &str) -> String {
+    let out = tokio::process::Command::new("container")
+        .args(["inspect", &format!("velos-{uid}")])
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "container inspect velos-{uid} failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let docs: Value = serde_json::from_slice(&out.stdout).unwrap();
+    docs.get(0)
+        .and_then(|d| d.pointer("/status/state"))
+        .and_then(Value::as_str)
+        .unwrap_or("<unknown>")
+        .to_string()
+}
+
+/// POST a container subresource (`hibernate` / `resume`).
+async fn post_sub(http: &reqwest::Client, base: &str, token: &str, name: &str, sub: &str) {
+    let resp = http
+        .post(format!("{base}/api/v1/containers/{name}/{sub}"))
+        .bearer_auth(token)
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        resp.status().is_success(),
+        "{sub} failed: {}",
+        resp.status()
+    );
+}
 
 /// Poll a container's `status.phase` until it is one of `wanted`, or panic on timeout.
 async fn await_phase(
@@ -254,6 +300,124 @@ async fn real_container_lifecycle_with_apple_containerization() {
             Instant::now() < deadline,
             "container was never hard-deleted"
         );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
+    // --- Hibernate / resume on a real, long-running micro-VM ---
+    //
+    // `restartPolicy: Always` is the load-bearing part: a hibernated micro-VM
+    // looks exited to the runtime, and the restart policy must not read that as
+    // a crash and boot it straight back up.
+    let resp = http
+        .post(format!("{base}/api/v1/containers"))
+        .bearer_auth(&credential)
+        .json(&json!({
+            "metadata": { "name": "c-sleep", "finalizers": ["veloslet"] },
+            "spec": {
+                "image": IMAGE,
+                "command": ["sleep", "600"],
+                "restartPolicy": "Always",
+                "resources": { "cpu": 1, "memoryBytes": 536870912u64 }
+            },
+            "status": { "phase": "Pending" }
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
+    await_phase(
+        &http,
+        &base,
+        &credential,
+        "c-sleep",
+        &["Running"],
+        Duration::from_secs(120),
+    )
+    .await;
+
+    // Hibernate: the CLI shuts the micro-VM down but keeps the instance.
+    post_sub(&http, &base, &credential, "c-sleep", "hibernate").await;
+    await_phase(
+        &http,
+        &base,
+        &credential,
+        "c-sleep",
+        &["Hibernated"],
+        Duration::from_secs(90),
+    )
+    .await;
+
+    // Hibernate is not delete: the instance is still there, merely stopped —
+    // and we ask the CLI, not Velos, so a parsing bug cannot fake this.
+    let uid = http
+        .get(format!("{base}/api/v1/containers/c-sleep"))
+        .bearer_auth(&credential)
+        .send()
+        .await
+        .unwrap()
+        .json::<Value>()
+        .await
+        .unwrap()["metadata"]["uid"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(
+        cli_state(&uid).await,
+        "stopped",
+        "hibernate must actually shut the micro-VM down, keeping the instance"
+    );
+
+    // It must *stay* asleep across several reconcile passes.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let doc: Value = http
+        .get(format!("{base}/api/v1/containers/c-sleep"))
+        .bearer_auth(&credential)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        doc["status"]["phase"], "Hibernated",
+        "restart policy must not wake a hibernated container"
+    );
+
+    // Wake it: `container start` boots the same instance back up.
+    post_sub(&http, &base, &credential, "c-sleep", "resume").await;
+    await_phase(
+        &http,
+        &base,
+        &credential,
+        "c-sleep",
+        &["Running"],
+        Duration::from_secs(90),
+    )
+    .await;
+    assert_eq!(
+        cli_state(&uid).await,
+        "running",
+        "resume must boot the same micro-VM back up"
+    );
+
+    // Clean up the real micro-VM through the finalizer protocol.
+    http.delete(format!("{base}/api/v1/containers/c-sleep"))
+        .bearer_auth(&credential)
+        .send()
+        .await
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let resp = http
+            .get(format!("{base}/api/v1/containers/c-sleep"))
+            .bearer_auth(&credential)
+            .send()
+            .await
+            .unwrap();
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            break;
+        }
+        assert!(Instant::now() < deadline, "c-sleep was never hard-deleted");
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
 }

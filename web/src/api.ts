@@ -104,6 +104,21 @@ export function useCreateContainer() {
   });
 }
 
+/// Hibernate / resume. Both are declarative POSTs: they set `spec.desiredState`
+/// and the owning worker converges the micro-VM, so the phase in the table
+/// catches up a reconcile interval later (the 2s poll picks it up).
+function useDesiredState(sub: "hibernate" | "resume") {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (name: string) =>
+      http<Container>(`/containers/${name}/${sub}`, { method: "POST" }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["containers"] }),
+  });
+}
+
+export const useHibernateContainer = () => useDesiredState("hibernate");
+export const useResumeContainer = () => useDesiredState("resume");
+
 export function useDeleteContainer() {
   const qc = useQueryClient();
   return useMutation({

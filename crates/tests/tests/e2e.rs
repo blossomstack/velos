@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 
-use velos_runtime::FakeRuntime;
+use velos_runtime::{ContainerRuntime, FakeRuntime};
 use velos_server::{app, controllers};
 use velos_store::{SqliteStore, Store};
 use veloslet::{ApiClient, run_once};
@@ -105,6 +105,105 @@ async fn container_runs_through_full_lifecycle() {
     let c = get_container(&http, &base, "c1").await;
     assert_eq!(c["status"]["phase"], "Succeeded");
     assert_eq!(c["status"]["exitCode"], 0);
+}
+
+#[tokio::test]
+async fn container_hibernates_and_wakes_on_the_same_instance() {
+    let (base, store) = start().await;
+    let http = reqwest::Client::new();
+
+    post(
+        &http,
+        &base,
+        "workers",
+        serde_json::json!({
+            "metadata": { "name": "w1" },
+            "spec": { "unschedulable": false },
+            "status": {
+                "allocatable": { "cpu": 4, "memoryBytes": 8589934592u64 },
+                "conditions": [{ "conditionType": "Ready", "status": true }]
+            }
+        }),
+    )
+    .await;
+    post(
+        &http,
+        &base,
+        "containers",
+        serde_json::json!({
+            "metadata": { "name": "c1" },
+            "spec": {
+                "image": "alpine",
+                // `Always` is the interesting case: a hibernated instance looks
+                // exited, and the restart policy must not fight the hibernation.
+                "restartPolicy": "Always",
+                "resources": { "cpu": 1, "memoryBytes": 536870912u64 }
+            },
+            "status": { "phase": "Pending" }
+        }),
+    )
+    .await;
+
+    // Schedule and launch it.
+    assert_eq!(
+        controllers::reconcile_scheduling(store.as_ref()).unwrap(),
+        1
+    );
+    let client = ApiClient::new(&base, None);
+    let runtime = FakeRuntime::new();
+    run_once(&client, &runtime, "w1").await.unwrap();
+    assert_eq!(
+        get_container(&http, &base, "c1").await["status"]["phase"],
+        "Running"
+    );
+    assert_eq!(runtime.run_count().unwrap(), 1);
+
+    // Hibernate through the public API: intent lands in the spec, and only the
+    // worker's next pass takes the micro-VM down.
+    let resp = http
+        .post(format!("{base}/api/v1/containers/c1/hibernate"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        get_container(&http, &base, "c1").await["status"]["phase"],
+        "Running",
+        "hibernating records intent; the worker reports the phase"
+    );
+
+    assert_eq!(run_once(&client, &runtime, "w1").await.unwrap(), 1);
+    let c = get_container(&http, &base, "c1").await;
+    assert_eq!(c["status"]["phase"], "Hibernated");
+    assert!(c["status"]["hibernatedAt"].is_string());
+    // Hibernate is not delete: object, binding, and instance all survive.
+    assert_eq!(c["status"]["workerName"], "w1");
+    assert_eq!(runtime.list().await.unwrap().len(), 1);
+
+    // Settled: further passes must not restart it despite `restartPolicy: Always`.
+    assert_eq!(run_once(&client, &runtime, "w1").await.unwrap(), 0);
+    assert_eq!(
+        get_container(&http, &base, "c1").await["status"]["phase"],
+        "Hibernated"
+    );
+
+    // Wake it: the same instance boots back up, no fresh launch.
+    let resp = http
+        .post(format!("{base}/api/v1/containers/c1/resume"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    assert_eq!(run_once(&client, &runtime, "w1").await.unwrap(), 1);
+    assert_eq!(
+        get_container(&http, &base, "c1").await["status"]["phase"],
+        "Running"
+    );
+    assert_eq!(
+        runtime.run_count().unwrap(),
+        1,
+        "resume must wake the existing micro-VM, not re-run the image"
+    );
 }
 
 /// Serve an auth-enabled server on an ephemeral port; return the base URL.
