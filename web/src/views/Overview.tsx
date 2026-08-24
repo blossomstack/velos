@@ -1,13 +1,19 @@
 import { Box, Cpu, MemoryStick, Server } from "lucide-react";
 import { useContainers, useWorkers } from "../api";
 import { Bar, Card } from "../ui";
-import { fmtBytes, isWorkerReady, phaseOf, PHASE_STYLES } from "../format";
+import {
+  boundWorker,
+  cpuOf,
+  fmtBytes,
+  holdsResources,
+  isSchedulable,
+  isWorkerReady,
+  memOf,
+  phaseOf,
+  PHASE_STYLES,
+} from "../format";
 import type { ContainerPhase } from "../types";
 
-// Phases that hold a share of a worker's capacity. `Hibernated` counts: the
-// micro-VM is down but its slot stays reserved, and this bar has to agree with
-// what the scheduler believes is committed.
-const ACTIVE: ContainerPhase[] = ["Scheduled", "Running", "Hibernated"];
 const ORDER: ContainerPhase[] = [
   "Running",
   "Pending",
@@ -22,23 +28,25 @@ export function Overview() {
   const { data: workers = [] } = useWorkers();
   const { data: containers = [] } = useContainers();
 
-  const readyWorkers = workers.filter(isWorkerReady);
-  const ready = readyWorkers.length;
+  const ready = workers.filter(isWorkerReady).length;
   const running = containers.filter((c) => phaseOf(c) === "Running").length;
 
-  // Cluster capacity vs. what scheduled/running containers have committed. Only
-  // Ready workers count: the scheduler refuses to place onto a NotReady worker,
-  // so its last-reported cores are not capacity anyone can use. Usage is filtered
-  // the same way — a container stranded on a NotReady worker is not holding a
-  // share of what is left, and counting it would push the bar past 100%.
-  const readyNames = new Set(readyWorkers.map((w) => w.metadata.name));
-  const capCpu = readyWorkers.reduce((a, w) => a + (w.status?.allocatable?.cpu ?? 0), 0);
-  const capMem = readyWorkers.reduce((a, w) => a + (w.status?.allocatable?.memoryBytes ?? 0), 0);
-  const committed = containers.filter(
-    (c) => ACTIVE.includes(phaseOf(c)) && !!c.spec.nodeName && readyNames.has(c.spec.nodeName),
-  );
-  const usedCpu = committed.reduce((a, c) => a + (c.spec.resources?.cpu ?? 1), 0);
-  const usedMem = committed.reduce((a, c) => a + (c.spec.resources?.memoryBytes ?? 512 * 1024 ** 2), 0);
+  // Cluster capacity vs. what the scheduler has committed. Only *schedulable*
+  // workers count: it refuses to place onto one that is NotReady or cordoned, so
+  // in both cases the last-reported cores are not capacity anyone can use.
+  // Usage is filtered the same way — a container stranded on a worker that has
+  // dropped out is not holding a share of what is left, and counting it would
+  // push the bar past 100%.
+  const usable = workers.filter(isSchedulable);
+  const usableNames = new Set(usable.map((w) => w.metadata.name));
+  const capCpu = usable.reduce((a, w) => a + (w.status?.allocatable?.cpu ?? 0), 0);
+  const capMem = usable.reduce((a, w) => a + (w.status?.allocatable?.memoryBytes ?? 0), 0);
+  const committed = containers.filter((c) => {
+    const on = boundWorker(c);
+    return holdsResources(c) && !!on && usableNames.has(on);
+  });
+  const usedCpu = committed.reduce((a, c) => a + cpuOf(c), 0);
+  const usedMem = committed.reduce((a, c) => a + memOf(c), 0);
 
   const byPhase = ORDER.map((p) => ({ phase: p, n: containers.filter((c) => phaseOf(c) === p).length })).filter(
     (x) => x.n > 0,
@@ -53,7 +61,7 @@ export function Overview() {
         <Stat icon={<Cpu size={18} />} label="Running now" value={String(running)} accent="text-sky-400" />
         <Stat
           icon={<MemoryStick size={18} />}
-          label="Cluster memory"
+          label="Schedulable memory"
           value={fmtBytes(capMem)}
           accent="text-violet-400"
         />

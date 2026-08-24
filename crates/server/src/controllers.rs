@@ -25,6 +25,11 @@ const DEFAULT_MEM: u64 = 512 * 1024 * 1024;
 /// Label opting a container into rescheduling when its node dies.
 const RESCHEDULABLE_LABEL: &str = "velos.io/reschedulable";
 
+/// `status.reason` tokens this crate writes. Short, stable, and safe to match
+/// on: a client that branches on the reason must not have to parse prose.
+const REASON_UNSCHEDULABLE: &str = "Unschedulable";
+const REASON_NODE_LOST: &str = "NodeLost";
+
 /// Tunables for the controller loops. Times mirror the design doc defaults.
 #[derive(Debug, Clone)]
 pub struct ControllerConfig {
@@ -415,6 +420,11 @@ pub fn reconcile_scheduling(store: &dyn Store) -> Result<usize, StoreError> {
                 {
                     status.insert("workerName".to_string(), serde_json::json!(b.worker));
                 }
+                // A binding answers whatever kept this container waiting. The
+                // container may have sat Pending long enough to be told why —
+                // that explanation is now wrong, and it would otherwise survive
+                // until the worker's first status write replaced the document.
+                clear_reason(&mut obj.document);
                 set_rv(&mut obj.document, rv);
                 obj.resource_version = rv;
                 obj.node_name = Some(b.worker.clone());
@@ -427,17 +437,11 @@ pub fn reconcile_scheduling(store: &dyn Store) -> Result<usize, StoreError> {
                 };
                 // Record why it can't be placed — but only on change, to avoid
                 // rewriting (and bumping the resource version) every tick.
-                if str_at(&obj.document, &["status", "message"]) == Some(reason.as_str()) {
+                if reason_is_current(&obj.document, REASON_UNSCHEDULABLE, reason) {
                     continue;
                 }
                 let rv = store.next_resource_version()?;
-                if let Some(status) = obj
-                    .document
-                    .get_mut("status")
-                    .and_then(Value::as_object_mut)
-                {
-                    status.insert("message".to_string(), serde_json::json!(reason));
-                }
+                set_reason(&mut obj.document, REASON_UNSCHEDULABLE, reason);
                 set_rv(&mut obj.document, rv);
                 obj.resource_version = rv;
                 store.put(&obj)?;
@@ -518,6 +522,47 @@ fn set_rv(doc: &mut Value, rv: u64) {
     if let Some(m) = doc.get_mut("metadata").and_then(Value::as_object_mut) {
         m.insert("resourceVersion".to_string(), serde_json::json!(rv));
     }
+}
+
+/// Record *why* a container is not in the state the user asked for.
+///
+/// A short machine-readable `reason` plus the human `message` — the same pair
+/// the worker writes for a launch it could not perform, so a client reads the
+/// answer from one place no matter which side of the split noticed the problem.
+fn set_reason(doc: &mut Value, reason: &str, message: &str) {
+    if !doc.get("status").map(Value::is_object).unwrap_or(false) {
+        doc["status"] = serde_json::json!({});
+    }
+    if let Some(s) = doc.get_mut("status").and_then(Value::as_object_mut) {
+        s.insert("reason".to_string(), serde_json::json!(reason));
+        s.insert("message".to_string(), serde_json::json!(message));
+    }
+}
+
+/// Drop a `reason`/`message` pair that a later event has answered.
+///
+/// Nothing else clears them. The worker's status writes replace the whole
+/// status document, so its own reasons expire on their own; the control plane's
+/// writes are field-level, so a reason left behind outlives the condition it
+/// described. A container that has just been bound is not still unschedulable,
+/// and leaving the old explanation on it is worse than never having written
+/// one — it is a confident answer to the wrong question.
+fn clear_reason(doc: &mut Value) {
+    if let Some(s) = doc.get_mut("status").and_then(Value::as_object_mut) {
+        s.remove("reason");
+        s.remove("message");
+    }
+}
+
+/// Whether `doc` already records exactly this reason.
+///
+/// The guard that keeps a reconcile loop from rewriting an object — and so
+/// bumping its resource version and waking every watcher — on every tick, for
+/// a condition that has not changed. For the conditions this exists to
+/// surface, "has not changed" often means forever.
+fn reason_is_current(doc: &Value, reason: &str, message: &str) -> bool {
+    str_at(doc, &["status", "reason"]) == Some(reason)
+        && str_at(doc, &["status", "message"]) == Some(message)
 }
 
 /// Actuator: flip worker readiness from lease freshness, then evict containers
@@ -602,8 +647,26 @@ pub fn reconcile_node_lifecycle(
                 }
                 obj.node_name = None;
                 set_phase(&mut obj.document, "Pending");
+                set_reason(
+                    &mut obj.document,
+                    REASON_NODE_LOST,
+                    &format!("worker {} stopped renewing its lease; rescheduling", w.name),
+                );
             } else {
+                // `Unknown` is the honest phase and a dead end: this container's
+                // disk was on that worker, so nothing can move it. Without a
+                // reason it is a grey badge and no way to find out why — the one
+                // state where the explanation is the entire content.
                 set_phase(&mut obj.document, "Unknown");
+                set_reason(
+                    &mut obj.document,
+                    REASON_NODE_LOST,
+                    &format!(
+                        "worker {} stopped renewing its lease; not labelled \
+                         {RESCHEDULABLE_LABEL}=true, so it was left bound to it",
+                        w.name
+                    ),
+                );
             }
             set_rv(&mut obj.document, rv);
             obj.resource_version = rv;
@@ -1277,5 +1340,150 @@ mod tests {
         reconcile_node_lifecycle(&store, now, Duration::from_secs(300)).unwrap();
         let c = store.get("Container", "c1").unwrap().unwrap();
         assert_eq!(phase(&c.document), Some("Unknown"));
+        // An `Unknown` container nothing can move is the one state where the
+        // reason is the whole content — without it the UI has a grey badge and
+        // no way to learn that the worker died.
+        assert_eq!(
+            str_at(&c.document, &["status", "reason"]),
+            Some(REASON_NODE_LOST)
+        );
+        let message = str_at(&c.document, &["status", "message"]).unwrap_or_default();
+        assert!(
+            message.contains("w1"),
+            "message must name the lost worker: {message}"
+        );
+        assert!(
+            message.contains(RESCHEDULABLE_LABEL),
+            "message must name the label that would have saved it: {message}"
+        );
+    }
+
+    #[test]
+    fn evicted_reschedulable_container_says_why_it_went_back_to_pending() {
+        let store = SqliteStore::in_memory().unwrap();
+        let mut w = ready_worker_doc("w1");
+        w["status"]["conditions"] = serde_json::json!([{
+            "conditionType": "Ready", "status": false,
+            "lastTransitionTime": "2026-06-27T00:00:00Z", "reason": "LeaseExpired"
+        }]);
+        put_doc(&store, "Worker", "w1", None, w);
+        let rv = store.next_resource_version().unwrap();
+        store
+            .put(&StoredObject {
+                kind: "Container".to_string(),
+                name: "c1".to_string(),
+                uid: uuid::Uuid::new_v4(),
+                resource_version: rv,
+                node_name: Some("w1".to_string()),
+                labels: std::collections::HashMap::from([(
+                    RESCHEDULABLE_LABEL.to_string(),
+                    "true".to_string(),
+                )]),
+                document: serde_json::json!({
+                    "metadata": {
+                        "name": "c1",
+                        "labels": { RESCHEDULABLE_LABEL: "true" },
+                        "resourceVersion": rv,
+                    },
+                    "spec": { "image": "img" },
+                    "status": { "phase": "Running", "workerName": "w1" }
+                }),
+            })
+            .unwrap();
+
+        let now = DateTime::parse_from_rfc3339("2026-06-27T00:10:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        reconcile_node_lifecycle(&store, now, Duration::from_secs(300)).unwrap();
+
+        let c = store.get("Container", "c1").unwrap().unwrap();
+        assert_eq!(phase(&c.document), Some("Pending"));
+        assert_eq!(c.node_name, None);
+        assert_eq!(
+            str_at(&c.document, &["status", "reason"]),
+            Some(REASON_NODE_LOST)
+        );
+    }
+
+    #[test]
+    fn unschedulable_container_records_a_reason_not_just_a_message() {
+        let store = SqliteStore::in_memory().unwrap();
+        // One Ready worker, far too small for the request.
+        let mut w = ready_worker_doc("w1");
+        w["status"]["allocatable"] = serde_json::json!({ "cpu": 1, "memoryBytes": GB });
+        w["status"]["conditions"] =
+            serde_json::json!([{ "conditionType": "Ready", "status": true }]);
+        put_doc(&store, "Worker", "w1", None, w);
+        put_doc(
+            &store,
+            "Container",
+            "c1",
+            None,
+            serde_json::json!({
+                "metadata": { "name": "c1" },
+                "spec": { "image": "img", "resources": { "cpu": 64, "memoryBytes": 64 * GB } },
+                "status": { "phase": "Pending" }
+            }),
+        );
+
+        assert_eq!(reconcile_scheduling(&store).unwrap(), 0);
+        let c = store.get("Container", "c1").unwrap().unwrap();
+        assert_eq!(
+            str_at(&c.document, &["status", "reason"]),
+            Some(REASON_UNSCHEDULABLE)
+        );
+        assert!(str_at(&c.document, &["status", "message"]).is_some());
+        let rv_after_first = c.resource_version;
+
+        // The guard: an unchanged verdict must not rewrite the object. This loop
+        // runs every few seconds and the condition can last forever.
+        assert_eq!(reconcile_scheduling(&store).unwrap(), 0);
+        let c = store.get("Container", "c1").unwrap().unwrap();
+        assert_eq!(c.resource_version, rv_after_first);
+    }
+
+    #[test]
+    fn binding_clears_the_unschedulable_reason() {
+        let store = SqliteStore::in_memory().unwrap();
+        let mut small = ready_worker_doc("w1");
+        small["status"]["allocatable"] = serde_json::json!({ "cpu": 1, "memoryBytes": GB });
+        small["status"]["conditions"] =
+            serde_json::json!([{ "conditionType": "Ready", "status": true }]);
+        put_doc(&store, "Worker", "w1", None, small);
+        put_doc(
+            &store,
+            "Container",
+            "c1",
+            None,
+            serde_json::json!({
+                "metadata": { "name": "c1" },
+                "spec": { "image": "img", "resources": { "cpu": 4, "memoryBytes": 2 * GB } },
+                "status": { "phase": "Pending" }
+            }),
+        );
+
+        // Round one: nothing fits, so the container is told why.
+        assert_eq!(reconcile_scheduling(&store).unwrap(), 0);
+        assert_eq!(
+            str_at(
+                &store.get("Container", "c1").unwrap().unwrap().document,
+                &["status", "reason"]
+            ),
+            Some(REASON_UNSCHEDULABLE)
+        );
+
+        // A worker joins that fits. Round two binds it — and the explanation for
+        // the wait is now false, so it must not survive the binding.
+        let mut big = ready_worker_doc("w2");
+        big["status"]["conditions"] =
+            serde_json::json!([{ "conditionType": "Ready", "status": true }]);
+        put_doc(&store, "Worker", "w2", None, big);
+
+        assert_eq!(reconcile_scheduling(&store).unwrap(), 1);
+        let c = store.get("Container", "c1").unwrap().unwrap();
+        assert_eq!(phase(&c.document), Some("Scheduled"));
+        assert_eq!(c.document["status"]["workerName"], "w2");
+        assert_eq!(str_at(&c.document, &["status", "reason"]), None);
+        assert_eq!(str_at(&c.document, &["status", "message"]), None);
     }
 }
