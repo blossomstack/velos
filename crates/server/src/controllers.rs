@@ -5,6 +5,7 @@
 //! actions to the `Store`. The decision functions are unit-tested in isolation;
 //! the actuators are the only side-effecting code.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -613,6 +614,156 @@ pub fn reconcile_node_lifecycle(
 }
 
 // ---------------------------------------------------------------------------
+// Service endpoints
+// ---------------------------------------------------------------------------
+
+/// One address a Service is answering on right now.
+///
+/// This is the whole point of the object: an external load balancer needs a
+/// concrete `address:nodePort` to send traffic to, and only the control plane
+/// knows which worker a container landed on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EndpointView {
+    pub worker_name: String,
+    pub address: String,
+    pub node_port: u64,
+    pub container_name: String,
+}
+
+impl EndpointView {
+    fn to_document(&self) -> Value {
+        serde_json::json!({
+            "workerName": self.worker_name,
+            "address": self.address,
+            "nodePort": self.node_port,
+            "containerName": self.container_name,
+        })
+    }
+}
+
+/// Each worker's first advertised address, keyed by worker name.
+///
+/// A worker that advertises none is simply absent: it is running containers
+/// nothing outside the machine can reach, and inventing an address for it would
+/// publish an endpoint that black-holes traffic.
+pub fn worker_addresses(workers: &[StoredObject]) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    for w in workers {
+        let address = w
+            .document
+            .pointer("/status/addresses")
+            .and_then(Value::as_array)
+            .and_then(|a| a.iter().find_map(Value::as_str));
+        if let Some(address) = address {
+            out.insert(w.name.clone(), address.to_string());
+        }
+    }
+    out
+}
+
+/// Whether a container's labels satisfy every entry of a Service selector.
+/// An empty selector matches nothing here — admission rejects one, and treating
+/// it as "match all" would turn a bad Service into a cluster-wide publication.
+fn selected(selector: &serde_json::Map<String, Value>, labels: &HashMap<String, String>) -> bool {
+    if selector.is_empty() {
+        return false;
+    }
+    selector.iter().all(|(k, v)| {
+        v.as_str()
+            .is_some_and(|v| labels.get(k).map(String::as_str) == Some(v))
+    })
+}
+
+/// Pure: where one Service is reachable, given every container and the workers'
+/// addresses. Returns the endpoints plus the number of otherwise-good backends
+/// dropped because their worker advertises no address (Principle #6: bounded
+/// results are counted, never silently dropped).
+pub fn endpoints_for(
+    service: &Value,
+    containers: &[StoredObject],
+    addresses: &HashMap<String, String>,
+) -> (Vec<EndpointView>, usize) {
+    let Some(selector) = service.pointer("/spec/selector").and_then(Value::as_object) else {
+        return (Vec::new(), 0);
+    };
+    let node_ports: Vec<u64> = service
+        .pointer("/spec/ports")
+        .and_then(Value::as_array)
+        .map(|ports| {
+            ports
+                .iter()
+                .filter_map(|p| p.get("nodePort").and_then(Value::as_u64))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let mut out = Vec::new();
+    let mut unaddressed = 0usize;
+    for c in containers {
+        // Only a running container answers. A `Pending` one has no worker, and a
+        // `Hibernated` one has a worker but nothing listening behind it.
+        if phase(&c.document) != Some("Running") || !selected(selector, &c.labels) {
+            continue;
+        }
+        let Some(worker) = worker_name(&c.document) else {
+            continue;
+        };
+        let Some(address) = addresses.get(worker) else {
+            unaddressed += node_ports.len();
+            continue;
+        };
+        for node_port in &node_ports {
+            out.push(EndpointView {
+                worker_name: worker.to_string(),
+                address: address.clone(),
+                node_port: *node_port,
+                container_name: c.name.clone(),
+            });
+        }
+    }
+    // Stable order, so an unchanged world produces an unchanged document and the
+    // actuator below does not churn the resource version on every pass.
+    out.sort_by(|a, b| (&a.container_name, a.node_port).cmp(&(&b.container_name, b.node_port)));
+    (out, unaddressed)
+}
+
+/// Actuator: recompute every Service's endpoints and write back the ones that
+/// changed. Returns how many Services were updated.
+pub fn reconcile_service_endpoints(store: &dyn Store) -> Result<usize, StoreError> {
+    let services = store.list("Service", &Selector::default())?;
+    if services.is_empty() {
+        return Ok(0);
+    }
+    let containers = store.list("Container", &Selector::default())?;
+    let addresses = worker_addresses(&store.list("Worker", &Selector::default())?);
+
+    let mut updated = 0;
+    for svc in services {
+        let (endpoints, unaddressed) = endpoints_for(&svc.document, &containers, &addresses);
+        if unaddressed > 0 {
+            tracing::warn!(
+                service = %svc.name,
+                dropped = unaddressed,
+                "service endpoints omitted: their worker advertises no address"
+            );
+        }
+        let next: Vec<Value> = endpoints.iter().map(EndpointView::to_document).collect();
+        let current = svc.document.pointer("/status/endpoints");
+        if current == Some(&Value::Array(next.clone())) {
+            continue;
+        }
+        let rv = store.next_resource_version()?;
+        let mut obj = svc.clone();
+        obj.document["status"] = serde_json::json!({ "endpoints": next });
+        set_rv(&mut obj.document, rv);
+        obj.resource_version = rv;
+        store.put(&obj)?;
+        updated += 1;
+    }
+    Ok(updated)
+}
+
+// ---------------------------------------------------------------------------
 // Loop wiring
 // ---------------------------------------------------------------------------
 
@@ -626,6 +777,18 @@ pub fn spawn(store: Arc<dyn Store>, cfg: ControllerConfig) {
             tick.tick().await;
             if let Err(e) = reconcile_scheduling(sched_store.as_ref()) {
                 tracing::warn!("scheduler reconcile failed: {e}");
+            }
+        }
+    });
+
+    let ep_store = Arc::clone(&store);
+    let ep_interval = cfg.schedule_interval;
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(ep_interval);
+        loop {
+            tick.tick().await;
+            if let Err(e) = reconcile_service_endpoints(ep_store.as_ref()) {
+                tracing::warn!("service-endpoints reconcile failed: {e}");
             }
         }
     });
@@ -725,6 +888,145 @@ mod tests {
                 "status": status,
             }),
         }
+    }
+
+    fn labelled_container(
+        name: &str,
+        phase: &str,
+        worker: Option<&str>,
+        labels: &[(&str, &str)],
+    ) -> StoredObject {
+        let mut obj = container_obj(name, phase, worker);
+        obj.labels = labels
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        obj
+    }
+
+    fn addressed_worker(name: &str, address: Option<&str>) -> StoredObject {
+        let mut obj = worker_obj(name, &[], serde_json::json!([]));
+        obj.document["status"]["addresses"] = match address {
+            Some(a) => serde_json::json!([a]),
+            None => serde_json::json!([]),
+        };
+        obj
+    }
+
+    fn service_obj(name: &str, selector: &[(&str, &str)], node_ports: &[u64]) -> StoredObject {
+        let sel: serde_json::Map<String, Value> = selector
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), serde_json::json!(v)))
+            .collect();
+        let ports: Vec<Value> = node_ports
+            .iter()
+            .map(|p| serde_json::json!({ "targetPort": 8080, "nodePort": p }))
+            .collect();
+        StoredObject {
+            kind: "Service".to_string(),
+            name: name.to_string(),
+            uid: uuid::Uuid::new_v4(),
+            resource_version: 0,
+            node_name: None,
+            labels: std::collections::HashMap::new(),
+            document: serde_json::json!({
+                "metadata": { "name": name },
+                "spec": { "selector": sel, "ports": ports },
+                "status": { "endpoints": [] },
+            }),
+        }
+    }
+
+    #[test]
+    fn endpoints_are_the_running_selected_containers_worker_addresses() {
+        let svc = service_obj("web", &[("app", "web")], &[31000]);
+        let containers = [
+            labelled_container("web-1", "Running", Some("w1"), &[("app", "web")]),
+            labelled_container("web-2", "Running", Some("w2"), &[("app", "web")]),
+            labelled_container("db-1", "Running", Some("w1"), &[("app", "db")]),
+        ];
+        let addresses = worker_addresses(&[
+            addressed_worker("w1", Some("192.168.68.51")),
+            addressed_worker("w2", Some("192.168.68.52")),
+        ]);
+        let (got, dropped) = endpoints_for(&svc.document, &containers, &addresses);
+        assert_eq!(dropped, 0);
+        assert_eq!(
+            got.iter().map(|e| e.address.as_str()).collect::<Vec<_>>(),
+            vec!["192.168.68.51", "192.168.68.52"],
+            "the unselected container must not appear"
+        );
+        assert!(got.iter().all(|e| e.node_port == 31000));
+    }
+
+    #[test]
+    fn only_a_running_container_is_an_endpoint() {
+        // A Pending container has no worker at all, and a Hibernated one has a
+        // worker with nothing listening behind it. Publishing either sends real
+        // traffic into a black hole.
+        let svc = service_obj("web", &[("app", "web")], &[31000]);
+        let addresses = worker_addresses(&[addressed_worker("w1", Some("192.168.68.51"))]);
+        for phase in ["Pending", "Hibernated", "Succeeded", "Failed"] {
+            let containers = [labelled_container(
+                "web-1",
+                phase,
+                Some("w1"),
+                &[("app", "web")],
+            )];
+            let (got, _) = endpoints_for(&svc.document, &containers, &addresses);
+            assert!(got.is_empty(), "{phase} must not be published");
+        }
+    }
+
+    #[test]
+    fn a_worker_without_an_address_is_counted_not_guessed() {
+        // No-silent-caps: the backend is real but unreachable, and the operator
+        // needs to know that rather than see a short endpoint list.
+        let svc = service_obj("web", &[("app", "web")], &[31000, 31001]);
+        let containers = [labelled_container(
+            "web-1",
+            "Running",
+            Some("w1"),
+            &[("app", "web")],
+        )];
+        let addresses = worker_addresses(&[addressed_worker("w1", None)]);
+        let (got, dropped) = endpoints_for(&svc.document, &containers, &addresses);
+        assert!(got.is_empty());
+        assert_eq!(dropped, 2, "one per port that could not be published");
+    }
+
+    #[test]
+    fn endpoints_reconcile_writes_once_and_then_settles() {
+        let store = SqliteStore::in_memory().unwrap();
+        store
+            .put(&service_obj("web", &[("app", "web")], &[31000]))
+            .unwrap();
+        store
+            .put(&labelled_container(
+                "web-1",
+                "Running",
+                Some("w1"),
+                &[("app", "web")],
+            ))
+            .unwrap();
+        store
+            .put(&addressed_worker("w1", Some("192.168.68.51")))
+            .unwrap();
+
+        assert_eq!(reconcile_service_endpoints(&store).unwrap(), 1);
+        let stored = store.get("Service", "web").unwrap().unwrap();
+        assert_eq!(
+            stored.document.pointer("/status/endpoints/0/address"),
+            Some(&serde_json::json!("192.168.68.51"))
+        );
+
+        // An unchanged world must not bump the resource version: every watcher
+        // wakes on a write, and this loop runs on a timer.
+        assert_eq!(
+            reconcile_service_endpoints(&store).unwrap(),
+            0,
+            "a settled Service was rewritten"
+        );
     }
 
     #[test]

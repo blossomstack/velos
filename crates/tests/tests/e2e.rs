@@ -11,7 +11,7 @@ use velos_server::{app, controllers};
 use velos_store::{SqliteStore, Store};
 use veloslet::daemon::{self, Bearer, WorkerConfig};
 use veloslet::memory::Memory;
-use veloslet::{ApiClient, run_once};
+use veloslet::{ApiClient, NodeProxy, run_once, sync_services};
 
 /// Bind an ephemeral port, serve the server in the background, and return the
 /// base URL plus the shared store (so the test can drive controllers directly).
@@ -107,6 +107,151 @@ async fn container_runs_through_full_lifecycle() {
     let c = get_container(&http, &base, "c1").await;
     assert_eq!(c["status"]["phase"], "Succeeded");
     assert_eq!(c["status"]["exitCode"], 0);
+}
+
+/// A Service must turn into a port on the worker that actually carries traffic
+/// to the container, and into an endpoint list the control plane publishes.
+/// Those are the two halves of "expose this container": the data path and the
+/// address an ingress is told to use. Either alone is useless.
+#[tokio::test]
+async fn a_service_forwards_a_node_port_to_its_container_and_publishes_the_endpoint() {
+    let (base, store) = start().await;
+    let http = reqwest::Client::new();
+
+    // Stands in for the process inside the container: an echo server on the
+    // address `FakeRuntime` reports for every instance (127.0.0.1).
+    let backend = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let target_port = backend.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut sock, _)) = backend.accept().await else {
+                return;
+            };
+            tokio::spawn(async move {
+                let (mut r, mut w) = sock.split();
+                let _ = tokio::io::copy(&mut r, &mut w).await;
+            });
+        }
+    });
+
+    post(
+        &http,
+        &base,
+        "workers",
+        serde_json::json!({
+            "metadata": { "name": "w1" },
+            "spec": { "unschedulable": false },
+            "status": {
+                "allocatable": { "cpu": 4, "memoryBytes": 8589934592u64 },
+                "addresses": ["127.0.0.1"],
+                "conditions": [{ "conditionType": "Ready", "status": true }]
+            }
+        }),
+    )
+    .await;
+    post(
+        &http,
+        &base,
+        "containers",
+        serde_json::json!({
+            "metadata": { "name": "web-1", "labels": { "app": "web" } },
+            "spec": { "image": "alpine", "resources": { "cpu": 1, "memoryBytes": 536870912u64 } },
+            "status": { "phase": "Pending" }
+        }),
+    )
+    .await;
+
+    controllers::reconcile_scheduling(store.as_ref()).unwrap();
+    let client = ApiClient::new(&base, None);
+    let runtime = FakeRuntime::new();
+    run_once(&client, &runtime, "w1").await.unwrap();
+    let container = get_container(&http, &base, "web-1").await;
+    assert_eq!(container["status"]["phase"], "Running");
+    let uid = container["metadata"]["uid"].as_str().unwrap().to_string();
+
+    // The Service names the container by label and asks for its port. The
+    // node port is the server's to allocate.
+    post(
+        &http,
+        &base,
+        "services",
+        serde_json::json!({
+            "metadata": { "name": "web" },
+            "spec": {
+                "selector": { "app": "web" },
+                "ports": [{ "targetPort": target_port }]
+            }
+        }),
+    )
+    .await;
+    let svc: serde_json::Value = http
+        .get(format!("{base}/api/v1/services/web"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let node_port = svc["spec"]["ports"][0]["nodePort"].as_u64().unwrap() as u16;
+    assert!((30000..=32767).contains(&node_port));
+
+    // The worker opens the port and forwards to the running container.
+    let proxy = NodeProxy::new();
+    assert_eq!(
+        sync_services(&client, &runtime, "w1", &proxy)
+            .await
+            .unwrap(),
+        1
+    );
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut conn = tokio::net::TcpStream::connect(("127.0.0.1", node_port))
+        .await
+        .expect("node port not listening");
+    conn.write_all(b"hello velos").await.unwrap();
+    conn.shutdown().await.unwrap();
+    let mut got = Vec::new();
+    conn.read_to_end(&mut got).await.unwrap();
+    assert_eq!(
+        &got, b"hello velos",
+        "node port did not reach the container"
+    );
+
+    // ...and the control plane publishes where that port can be reached, which
+    // is what an external proxy is configured from.
+    controllers::reconcile_service_endpoints(store.as_ref()).unwrap();
+    let svc: serde_json::Value = http
+        .get(format!("{base}/api/v1/services/web"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        svc["status"]["endpoints"],
+        serde_json::json!([{
+            "workerName": "w1",
+            "address": "127.0.0.1",
+            "nodePort": node_port,
+            "containerName": "web-1",
+        }])
+    );
+
+    // The container goes away; the port must stop listening rather than keep
+    // accepting connections it has nowhere to send.
+    runtime.set_exited(&uid, 0).unwrap();
+    run_once(&client, &runtime, "w1").await.unwrap();
+    sync_services(&client, &runtime, "w1", &proxy)
+        .await
+        .unwrap();
+    assert!(proxy.bound_ports().await.is_empty());
+    assert!(
+        tokio::net::TcpStream::connect(("127.0.0.1", node_port))
+            .await
+            .is_err(),
+        "the node port kept accepting after its container exited"
+    );
 }
 
 #[tokio::test]

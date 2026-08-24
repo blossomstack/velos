@@ -43,7 +43,7 @@ direction.
 
 ## Resource model
 
-Velos manages three object types, each with `metadata` / `spec` / `status`, served
+Velos manages four object types, each with `metadata` / `spec` / `status`, served
 under `/api/v1/{plural}`:
 
 - **Container** — a workload. Its phase moves `Pending → Scheduled → Running →
@@ -52,6 +52,59 @@ under `/api/v1/{plural}`:
 - **Worker** — a registered machine, with its capacity and a `Ready` condition.
 - **Lease** — a worker's periodic heartbeat; a stale lease marks its worker
   `NotReady`.
+- **Service** — a stable port in front of the containers a label selector picks
+  out, wherever they are running — see [Services](#services).
+
+## Services
+
+A container's address lives on its worker's own container network, which is
+reachable from that Mac and nowhere else. A **Service** turns a set of containers
+into something the rest of the network can reach:
+
+```bash
+velosctl apply service -f web-service.json
+```
+
+```json
+{
+  "metadata": { "name": "web" },
+  "spec": {
+    "selector": { "app": "web" },
+    "ports": [{ "targetPort": 8080 }]
+  }
+}
+```
+
+The server allocates a **node port** in `30000-32767`, and every worker running a
+selected container opens that port and forwards it to `targetPort` inside the
+container. `status.endpoints` lists where the service is answering right now:
+
+```json
+"endpoints": [
+  { "workerName": "mac-1", "address": "192.168.68.51", "nodePort": 31007, "containerName": "web-1" }
+]
+```
+
+Velos has no cluster IP, because there is nothing to put one on: every worker's
+container network is a separate island and they all use the same address range.
+So a Service is Kubernetes' `NodePort` with `externalTrafficPolicy: Local`, and
+nothing else. The port only listens where a replica actually runs, which means an
+external load balancer can point at every worker unconditionally — a worker
+without a replica refuses the connection and drops out of rotation by itself.
+
+Two consequences worth knowing before you use it:
+
+- A node port is bound on `0.0.0.0` and is **not authenticated**. Anything on the
+  LAN can reach it directly, bypassing whatever you put in front. This is true of
+  Kubernetes NodePort too, and it is the reason to keep the workers on a trusted
+  network.
+- Forwarding is TCP and is done in userspace by `veloslet`. `container run
+  --publish` would be the obvious mechanism and does not work: on
+  apple/container 1.0.0 a published port binds and then fails to reach the
+  container behind it.
+
+See [the guide](docs/getting-started.md#9-exposing-a-service) for putting a real
+reverse proxy in front of one.
 
 ## Hibernation
 

@@ -23,7 +23,7 @@ use clap::{Parser, Subcommand};
 use velos_runtime::{AppleContainer, ContainerRuntime};
 use veloslet::config::{self, Edits, Field};
 use veloslet::daemon::{self, BUNDLE_EXECUTABLE, BUNDLE_ID, Bearer, WorkerConfig};
-use veloslet::host::{detect_host, detect_system_info, validate_capacity};
+use veloslet::host::{detect_address, detect_host, detect_system_info, validate_capacity};
 use veloslet::{ApiClient, run_loop};
 
 mod signing;
@@ -229,10 +229,14 @@ async fn setup(args: SetupArgs) -> Result<()> {
 /// The registration body a worker publishes about itself.
 fn registration(cfg: &WorkerConfig, runtime_version: &str) -> serde_json::Value {
     let sys = detect_system_info();
+    // The address the control plane hands to whatever fronts this worker's
+    // services. Without it a container here is reachable from nowhere, so an
+    // endpoint for it is never published.
+    let addresses: Vec<String> = detect_address(&cfg.server).into_iter().collect();
     serde_json::json!({
         "name": cfg.node,
         "capacity": { "cpu": cfg.cpu, "memoryBytes": cfg.memory.bytes() },
-        "addresses": [],
+        "addresses": addresses,
         "containerRuntimeVersion": runtime_version,
         "nodeInfo": {
             "agentVersion": sys.agent_version,

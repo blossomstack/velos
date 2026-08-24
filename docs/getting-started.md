@@ -12,9 +12,10 @@ containers, and understand what happens under the hood.
 - [6. Use the CLI (velosctl)](#6-use-the-cli-velosctl)
 - [7. Use the dashboard](#7-use-the-dashboard)
 - [8. The container lifecycle](#8-the-container-lifecycle)
-- [9. Authentication](#9-authentication)
-- [10. Troubleshooting](#10-troubleshooting)
-- [11. Tearing down](#11-tearing-down)
+- [9. Exposing a service](#9-exposing-a-service)
+- [10. Authentication](#10-authentication)
+- [11. Troubleshooting](#11-troubleshooting)
+- [12. Tearing down](#12-tearing-down)
 
 ---
 
@@ -117,7 +118,7 @@ VELOS_LISTEN=0.0.0.0:8080 velos-server
 ```
 
 > Binding `0.0.0.0` exposes the server on the network. That's reasonable now that
-> auth is enforced (§9), but anyone who can reach the port can still attempt the
+> auth is enforced (§10), but anyone who can reach the port can still attempt the
 > first-run setup — initialize the admin account promptly.
 
 Control log verbosity with `RUST_LOG`, e.g. `RUST_LOG=info velos-server`.
@@ -129,7 +130,7 @@ except the first-run setup is rejected until you create the admin account
 ## 4. First-run setup & connecting velosctl
 
 Velos has one **admin** account, created once on first run, plus per-worker
-identities (§9). The admin is set up through the dashboard, which then mints the
+identities (§10). The admin is set up through the dashboard, which then mints the
 **CLI token** that `velosctl` carries.
 
 1. Open **`http://127.0.0.1:8080`**. On first run it shows a **Setup** screen —
@@ -198,7 +199,7 @@ script can gate on it. It only reads; nothing it does changes state.
 > Prefer the CLI without a browser? You can drive setup over HTTP directly:
 > `curl -X POST :8080/auth/v1/setup -d '{"username":"admin","password":"…"}'`,
 > then `curl -X POST :8080/auth/v1/login …` for a session token and
-> `POST /auth/v1/admin/tokens {"label":"laptop"}` for a CLI token. See §9.
+> `POST /auth/v1/admin/tokens {"label":"laptop"}` for a CLI token. See §10.
 
 ## 5. Register a worker
 
@@ -369,6 +370,7 @@ velosctl get workers
 velosctl get containers
 velosctl get container my-job
 velosctl get containers --selector app=demo
+velosctl get services
 
 # Create from a JSON file (status.phase MUST be "Pending" to be scheduled)
 cat > job.json <<'JSON'
@@ -454,7 +456,112 @@ If a worker's lease goes stale, the health controller marks it `NotReady`; after
 a grace period its containers are evicted (rescheduled if labeled
 `velos.io/reschedulable=true`, otherwise marked `Unknown`).
 
-## 9. Authentication
+## 9. Exposing a service
+
+A container's address (`192.168.64.x` under Apple Containerization) is reachable
+from its own worker Mac and nowhere else, and every worker hands out the same
+range. A **Service** is how you get a container to answer somewhere the rest of
+your network can reach.
+
+### Create one
+
+Label the container, then select it:
+
+```bash
+cat > web.json <<'JSON'
+{
+  "metadata": { "name": "web-1", "labels": { "app": "web" } },
+  "spec": {
+    "image": "docker.io/library/nginx",
+    "resources": { "cpu": 1, "memoryBytes": 536870912 }
+  },
+  "status": { "phase": "Pending" }
+}
+JSON
+
+cat > web-svc.json <<'JSON'
+{
+  "metadata": { "name": "web" },
+  "spec": {
+    "selector": { "app": "web" },
+    "ports": [{ "targetPort": 80 }]
+  }
+}
+JSON
+
+velosctl apply container -f web.json
+velosctl apply service   -f web-svc.json
+velosctl get service web
+```
+
+The server fills in a **node port** from `30000-32767`:
+
+```json
+"ports": [{ "targetPort": 80, "nodePort": 31007 }]
+```
+
+Give it a reconcile interval, and `status.endpoints` tells you where it is
+answering:
+
+```json
+"endpoints": [
+  { "workerName": "mac-1", "address": "192.168.68.51", "nodePort": 31007, "containerName": "web-1" }
+]
+```
+
+`curl http://192.168.68.51:31007` now reaches the container.
+
+Set `nodePort` yourself if you want a fixed one; the server rejects it with `409`
+if another Service already holds it. Multiple ports each need a `name`.
+
+### What is actually happening
+
+Every worker running a selected container opens the node port on `0.0.0.0` and
+forwards it, in userspace, to `targetPort` inside the container. This is
+Kubernetes' `NodePort` with `externalTrafficPolicy: Local`: the port listens
+**only** where a replica is running. A worker without one refuses the connection.
+
+That property is what makes the next step simple.
+
+### Put a reverse proxy in front
+
+Because a worker without a replica refuses the connection, a proxy can list every
+worker unconditionally and let health checks decide. With Caddy:
+
+```caddyfile
+web.example.lan {
+	reverse_proxy 192.168.68.51:31007 192.168.68.52:31007 192.168.68.53:31007 {
+		lb_policy       round_robin
+		health_uri      /
+		health_interval 5s
+	}
+}
+```
+
+Move the container to another worker and Caddy follows within one health
+interval — no config change, because the node port is the same number on every
+worker. The worker list only changes when you add or remove machines.
+
+For nginx the equivalent is an `upstream` block with `max_fails` / `fail_timeout`;
+for HAProxy, a `backend` with `check`.
+
+### Things to know
+
+- **Node ports are unauthenticated.** They are bound on `0.0.0.0`, so anything on
+  the LAN can reach a container directly and bypass your proxy. Kubernetes
+  NodePort behaves the same way. Keep workers on a trusted network, or firewall
+  the range to the proxy's address.
+- **TCP only.** The worker proxy forwards TCP. UDP is not supported.
+- **A worker that advertises no address publishes no endpoint.** `veloslet` reports
+  the address it reaches the control plane from when it registers; if it cannot
+  work one out, its containers still run but never appear in `status.endpoints`,
+  and the server logs why.
+- **`container run --publish` is not used**, and cannot be: on apple/container
+  1.0.0 a published port binds on the host and then fails to reach the container
+  behind it (`backend - connect failed: No route to host`), so connections are
+  accepted and dropped. Velos does the forwarding itself instead.
+
+## 10. Authentication
 
 Velos is fail-closed and recognizes two kinds of identity:
 
@@ -504,7 +611,7 @@ Auth endpoints at a glance:
 > can be integrated later (validate a JWT against the provider) without changing
 > any endpoint. Single-admin and the two-tier model are the current scope.
 
-## 10. Troubleshooting
+## 11. Troubleshooting
 
 Start with **`velosctl doctor`** (§4), or **`veloslet status`** on a worker machine — it names the broken layer and the command
 that fixes it. The table below covers the rest.
@@ -523,7 +630,7 @@ that fixes it. The table below covers the rest.
 | Dashboard says "server unreachable" | The server isn't running, or you opened the dev server while the server is down. |
 | `address already in use` on start | Something already holds `:8080` — `lsof -nP -iTCP:8080 -sTCP:LISTEN`. |
 
-## 11. Tearing down
+## 12. Tearing down
 
 ```bash
 # Stop the processes (Ctrl-C in their terminals, or:)

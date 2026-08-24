@@ -7,7 +7,7 @@
 pub mod controllers;
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use axum::body::Body;
@@ -29,8 +29,15 @@ const WATCH_POLL: Duration = Duration::from_millis(100);
 pub struct AppState {
     store: Arc<dyn Store>,
     auth: Option<Arc<dyn AuthService>>,
+    /// Serializes node-port allocation. Choosing a free port is a read of every
+    /// Service followed by a write that claims it; without this lock two
+    /// concurrent creates both read the same free port and both claim it, and
+    /// the second Service silently steals the first one's listener on every
+    /// worker. Held across the scan *and* the store write, never across an await.
+    port_alloc: Arc<Mutex<()>>,
 }
 
+#[derive(Debug)]
 pub enum ApiError {
     NotFound,
     BadRequest(String),
@@ -81,6 +88,7 @@ fn kind_for(plural: &str) -> Option<&'static str> {
         "containers" => Some("Container"),
         "workers" => Some("Worker"),
         "leases" => Some("Lease"),
+        "services" => Some(KIND_SERVICE),
         _ => None,
     }
 }
@@ -260,6 +268,221 @@ fn validate_term(term: &Value) -> Result<(), ApiError> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Service admission and node-port allocation
+// ---------------------------------------------------------------------------
+
+const KIND_SERVICE: &str = "Service";
+
+/// The node-port range, mirroring Kubernetes' `30000-32767` default. It sits
+/// above the ephemeral range macOS hands out (49152+), so an allocated port
+/// cannot collide with an outbound connection a worker happens to have open.
+const NODE_PORT_MIN: u64 = 30000;
+const NODE_PORT_MAX: u64 = 32767;
+
+/// Highest legal TCP port, the ceiling for `targetPort`.
+const MAX_PORT: u64 = 65535;
+
+/// The node ports a stored Service document has claimed. Unreadable entries are
+/// skipped rather than treated as free: a port we cannot parse must not be
+/// handed to a second Service.
+fn claimed_node_ports(doc: &Value) -> Vec<u64> {
+    doc.pointer("/spec/ports")
+        .and_then(Value::as_array)
+        .map(|ports| {
+            ports
+                .iter()
+                .filter_map(|p| p.get("nodePort").and_then(Value::as_u64))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Admission for a Service (fail closed). Rejects shapes the endpoints
+/// controller and the worker-side proxy would otherwise have to guess at.
+///
+/// An empty `selector` is rejected rather than treated as "match everything":
+/// Kubernetes gives that case a separate, explicit meaning (manually managed
+/// endpoints), and silently publishing every container in the cluster behind
+/// one name is the worst available reading of a typo.
+fn validate_service(kind: &str, doc: &Value) -> Result<(), ApiError> {
+    if kind != KIND_SERVICE {
+        return Ok(());
+    }
+    let spec = doc
+        .get("spec")
+        .and_then(Value::as_object)
+        .ok_or_else(|| ApiError::BadRequest("spec must be an object".into()))?;
+
+    let selector = spec
+        .get("selector")
+        .and_then(Value::as_object)
+        .ok_or_else(|| ApiError::BadRequest("spec.selector must be an object".into()))?;
+    if selector.is_empty() {
+        return Err(ApiError::BadRequest(
+            "spec.selector must not be empty — a Service selects the containers it fronts".into(),
+        ));
+    }
+    for (k, v) in selector {
+        if !v.is_string() {
+            return Err(ApiError::BadRequest(format!(
+                "spec.selector.{k} must be a string"
+            )));
+        }
+    }
+
+    let ports = spec
+        .get("ports")
+        .and_then(Value::as_array)
+        .ok_or_else(|| ApiError::BadRequest("spec.ports must be an array".into()))?;
+    if ports.is_empty() {
+        return Err(ApiError::BadRequest("spec.ports must not be empty".into()));
+    }
+
+    let mut names: Vec<&str> = Vec::new();
+    let mut node_ports: Vec<u64> = Vec::new();
+    for (i, port) in ports.iter().enumerate() {
+        let port = port
+            .as_object()
+            .ok_or_else(|| ApiError::BadRequest(format!("spec.ports[{i}] must be an object")))?;
+
+        let target = port
+            .get("targetPort")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| {
+                ApiError::BadRequest(format!("spec.ports[{i}].targetPort must be a number"))
+            })?;
+        if target == 0 || target > MAX_PORT {
+            return Err(ApiError::BadRequest(format!(
+                "spec.ports[{i}].targetPort must be 1-{MAX_PORT}, got {target}"
+            )));
+        }
+
+        // A name is what distinguishes one port from another to a human and in
+        // an endpoint list, so it is required exactly when there is something to
+        // distinguish (the Kubernetes rule).
+        let name = match port.get("name") {
+            None | Some(Value::Null) if ports.len() == 1 => "",
+            Some(Value::String(n)) if !n.is_empty() => n.as_str(),
+            _ => {
+                return Err(ApiError::BadRequest(format!(
+                    "spec.ports[{i}].name is required and must be a non-empty string when a Service has more than one port"
+                )));
+            }
+        };
+        if !name.is_empty() && names.contains(&name) {
+            return Err(ApiError::BadRequest(format!(
+                "duplicate port name {name:?} in spec.ports"
+            )));
+        }
+        names.push(name);
+
+        match port.get("nodePort") {
+            None | Some(Value::Null) => {}
+            Some(v) => {
+                let np = v.as_u64().ok_or_else(|| {
+                    ApiError::BadRequest(format!("spec.ports[{i}].nodePort must be a number"))
+                })?;
+                if !(NODE_PORT_MIN..=NODE_PORT_MAX).contains(&np) {
+                    return Err(ApiError::BadRequest(format!(
+                        "spec.ports[{i}].nodePort must be {NODE_PORT_MIN}-{NODE_PORT_MAX}, got {np}"
+                    )));
+                }
+                if node_ports.contains(&np) {
+                    return Err(ApiError::BadRequest(format!(
+                        "duplicate nodePort {np} in spec.ports"
+                    )));
+                }
+                node_ports.push(np);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Fill in every unset `nodePort` and reject one already claimed elsewhere.
+///
+/// `self_name` is excluded from the conflict scan so replacing a Service keeps
+/// the ports it already owns instead of colliding with itself. Callers must
+/// hold `AppState::port_alloc` across this and the store write that follows.
+fn allocate_node_ports(
+    store: &dyn Store,
+    self_name: &str,
+    doc: &mut Value,
+) -> Result<(), ApiError> {
+    let mut taken: Vec<u64> = store
+        .list(KIND_SERVICE, &Selector::default())?
+        .iter()
+        .filter(|obj| obj.name != self_name)
+        .flat_map(|obj| claimed_node_ports(&obj.document))
+        .collect();
+
+    let Some(ports) = doc.pointer_mut("/spec/ports").and_then(Value::as_array_mut) else {
+        return Ok(());
+    };
+
+    // Two passes: honour every explicitly requested port first, so an
+    // auto-allocation can never take a port this same document asked for.
+    for port in ports.iter() {
+        if let Some(np) = port.get("nodePort").and_then(Value::as_u64) {
+            if taken.contains(&np) {
+                return Err(ApiError::Conflict(format!(
+                    "nodePort {np} is already allocated to another Service"
+                )));
+            }
+            taken.push(np);
+        }
+    }
+    for (i, port) in ports.iter_mut().enumerate() {
+        let Some(port) = port.as_object_mut() else {
+            continue;
+        };
+        if port.get("nodePort").and_then(Value::as_u64).is_some() {
+            continue;
+        }
+        let free = (NODE_PORT_MIN..=NODE_PORT_MAX)
+            .find(|p| !taken.contains(p))
+            .ok_or_else(|| {
+                ApiError::Conflict(format!(
+                    "no free nodePort in {NODE_PORT_MIN}-{NODE_PORT_MAX} for spec.ports[{i}]"
+                ))
+            })?;
+        taken.push(free);
+        port.insert("nodePort".to_string(), serde_json::json!(free));
+    }
+    Ok(())
+}
+
+/// Give a Service the empty endpoint list its served shape promises, so a
+/// caller reading `status.endpoints` never has to tell "none yet" apart from
+/// "this server does not populate the field".
+fn stamp_service_status(kind: &str, doc: &mut Value) {
+    if kind != KIND_SERVICE {
+        return;
+    }
+    if doc.pointer("/status/endpoints").is_none() {
+        doc["status"] = serde_json::json!({ "endpoints": [] });
+    }
+}
+
+/// Take the node-port allocation lock for a Service write (and nothing else).
+///
+/// The guard must stay alive until the store write completes. Every caller is a
+/// straight line of synchronous store calls, so it never crosses an await.
+fn lock_port_alloc<'a>(
+    state: &'a AppState,
+    kind: &str,
+) -> Result<Option<std::sync::MutexGuard<'a, ()>>, ApiError> {
+    if kind != KIND_SERVICE {
+        return Ok(None);
+    }
+    state
+        .port_alloc
+        .lock()
+        .map(Some)
+        .map_err(|_| ApiError::Internal("node-port allocator lock poisoned".into()))
+}
+
 /// Stamps server-owned envelope fields into a (mutable) object document.
 fn stamp_meta(doc: &mut Value, uid: &Uuid, rv: u64) {
     if !doc.get("metadata").map(Value::is_object).unwrap_or(false) {
@@ -319,8 +542,15 @@ async fn create(
     let name =
         extract_name(&body).ok_or_else(|| ApiError::BadRequest("metadata.name required".into()))?;
     validate_placement(kind, &body)?;
+    validate_service(kind, &body)?;
     normalize_desired_state(kind, &mut body)?;
     let uid = Uuid::new_v4();
+
+    let alloc = lock_port_alloc(&state, kind)?;
+    if kind == KIND_SERVICE {
+        allocate_node_ports(state.store.as_ref(), &name, &mut body)?;
+    }
+    stamp_service_status(kind, &mut body);
     let rv = state.store.next_resource_version()?;
     stamp_meta(&mut body, &uid, rv);
 
@@ -334,6 +564,7 @@ async fn create(
         document: body.clone(),
     };
     state.store.put(&obj)?;
+    drop(alloc);
     Ok((StatusCode::CREATED, Json(body)))
 }
 
@@ -445,6 +676,7 @@ async fn replace(
         return Err(ApiError::BadRequest("body must be a JSON object".into()));
     }
     validate_placement(kind, &body)?;
+    validate_service(kind, &body)?;
     normalize_desired_state(kind, &mut body)?;
     // Capture the client's optimistic-concurrency precondition before re-stamping.
     let precondition = body
@@ -452,7 +684,19 @@ async fn replace(
         .and_then(|m| m.get("resourceVersion"))
         .and_then(Value::as_u64);
 
+    let alloc = lock_port_alloc(&state, kind)?;
     let existing = state.store.get(kind, &name)?.ok_or(ApiError::NotFound)?;
+    if kind == KIND_SERVICE {
+        allocate_node_ports(state.store.as_ref(), &name, &mut body)?;
+    }
+    // A Service's endpoints are controller-owned: an edit that omits `status`
+    // must not blank them, so carry the stored list forward.
+    if kind == KIND_SERVICE && body.pointer("/status/endpoints").is_none() {
+        match existing.document.get("status") {
+            Some(status) => body["status"] = status.clone(),
+            None => stamp_service_status(kind, &mut body),
+        }
+    }
     let rv = state.store.next_resource_version()?;
     stamp_meta(&mut body, &existing.uid, rv);
 
@@ -498,6 +742,7 @@ async fn replace(
         Some(expected) => state.store.put_cas(&obj, expected)?,
         None => state.store.put(&obj)?,
     }
+    drop(alloc);
     Ok(Json(body))
 }
 
@@ -1105,7 +1350,11 @@ async fn serve_ui(uri: Uri) -> Response {
 
 /// Build the server with no authentication (dev / tests / e2e).
 pub fn app(store: Arc<dyn Store>) -> Router {
-    let state = AppState { store, auth: None };
+    let state = AppState {
+        store,
+        auth: None,
+        port_alloc: Arc::new(Mutex::new(())),
+    };
     api_routes()
         .route("/healthz", get(healthz))
         .fallback(serve_ui)
@@ -1119,6 +1368,7 @@ pub fn app_with_auth(store: Arc<dyn Store>, auth: Arc<dyn AuthService>) -> Route
     let state = AppState {
         store,
         auth: Some(Arc::clone(&auth)),
+        port_alloc: Arc::new(Mutex::new(())),
     };
     let protected = api_routes().layer(middleware::from_fn_with_state(
         Arc::clone(&auth),
@@ -1161,6 +1411,167 @@ mod tests {
     fn test_app() -> axum::Router {
         let store = Arc::new(velos_store::SqliteStore::in_memory().unwrap());
         app(store)
+    }
+
+    fn service(ports: Value) -> Value {
+        serde_json::json!({
+            "metadata": { "name": "web" },
+            "spec": { "selector": { "app": "web" }, "ports": ports },
+        })
+    }
+
+    #[test]
+    fn service_admission_rejects_an_empty_selector() {
+        // "Match everything" is the worst reading of a typo: it would publish
+        // every container in the cluster behind one name.
+        let doc = serde_json::json!({
+            "metadata": { "name": "web" },
+            "spec": { "selector": {}, "ports": [ { "targetPort": 8080 } ] },
+        });
+        assert!(validate_service(KIND_SERVICE, &doc).is_err());
+    }
+
+    #[test]
+    fn service_admission_checks_port_shape() {
+        assert!(validate_service(KIND_SERVICE, &service(serde_json::json!([]))).is_err());
+        assert!(
+            validate_service(
+                KIND_SERVICE,
+                &service(serde_json::json!([{ "targetPort": 0 }]))
+            )
+            .is_err(),
+            "port 0 is not a port"
+        );
+        assert!(
+            validate_service(
+                KIND_SERVICE,
+                &service(serde_json::json!([{ "targetPort": 70000 }]))
+            )
+            .is_err()
+        );
+        assert!(
+            validate_service(
+                KIND_SERVICE,
+                &service(serde_json::json!([{ "targetPort": 8080, "nodePort": 8080 }]))
+            )
+            .is_err(),
+            "a nodePort outside the allocation range would collide with an app port"
+        );
+        assert!(
+            validate_service(
+                KIND_SERVICE,
+                &service(serde_json::json!([
+                    { "name": "a", "targetPort": 8080 },
+                    { "targetPort": 8081 },
+                ]))
+            )
+            .is_err(),
+            "multiple ports must be named to be distinguishable"
+        );
+        assert!(
+            validate_service(
+                KIND_SERVICE,
+                &service(serde_json::json!([{ "targetPort": 8080 }]))
+            )
+            .is_ok(),
+            "a single unnamed port is the common case"
+        );
+    }
+
+    #[test]
+    fn node_ports_are_allocated_and_not_reused() {
+        let store = velos_store::SqliteStore::in_memory().unwrap();
+        let mut first = service(serde_json::json!([{ "targetPort": 8080 }]));
+        allocate_node_ports(&store, "web", &mut first).unwrap();
+        let allocated = first.pointer("/spec/ports/0/nodePort").unwrap().as_u64();
+        assert_eq!(allocated, Some(NODE_PORT_MIN));
+
+        store
+            .put(&StoredObject {
+                kind: KIND_SERVICE.to_string(),
+                name: "web".to_string(),
+                uid: Uuid::new_v4(),
+                resource_version: 1,
+                node_name: None,
+                labels: HashMap::new(),
+                document: first.clone(),
+            })
+            .unwrap();
+
+        // A second Service must not be handed the port the first one holds:
+        // both would bind it on the same worker and one would silently lose.
+        let mut second = service(serde_json::json!([{ "targetPort": 9090 }]));
+        allocate_node_ports(&store, "api", &mut second).unwrap();
+        assert_eq!(
+            second.pointer("/spec/ports/0/nodePort").unwrap().as_u64(),
+            Some(NODE_PORT_MIN + 1)
+        );
+
+        // Asking for a taken port explicitly is a conflict, not a silent move.
+        let mut clash = service(serde_json::json!([
+            { "targetPort": 9090, "nodePort": NODE_PORT_MIN }
+        ]));
+        assert!(matches!(
+            allocate_node_ports(&store, "api", &mut clash),
+            Err(ApiError::Conflict(_))
+        ));
+
+        // ...but the Service that already owns it may keep it on replace.
+        let mut same = service(serde_json::json!([
+            { "targetPort": 8080, "nodePort": NODE_PORT_MIN }
+        ]));
+        assert!(allocate_node_ports(&store, "web", &mut same).is_ok());
+    }
+
+    #[test]
+    fn an_explicit_port_is_never_stolen_by_an_auto_allocation() {
+        // Both ports are allocated in one document: the auto-allocated one must
+        // see the explicit request even though it comes later in the array.
+        let store = velos_store::SqliteStore::in_memory().unwrap();
+        let mut doc = service(serde_json::json!([
+            { "name": "a", "targetPort": 8080 },
+            { "name": "b", "targetPort": 8081, "nodePort": NODE_PORT_MIN },
+        ]));
+        allocate_node_ports(&store, "web", &mut doc).unwrap();
+        assert_eq!(
+            doc.pointer("/spec/ports/0/nodePort").unwrap().as_u64(),
+            Some(NODE_PORT_MIN + 1)
+        );
+    }
+
+    #[tokio::test]
+    async fn creating_a_service_allocates_a_node_port_and_empty_endpoints() {
+        let app = test_app();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/services")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        service(serde_json::json!([{ "targetPort": 8080 }])).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let body: Value = serde_json::from_slice(
+            &axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            body.pointer("/spec/ports/0/nodePort")
+                .and_then(Value::as_u64),
+            Some(NODE_PORT_MIN)
+        );
+        assert_eq!(
+            body.pointer("/status/endpoints"),
+            Some(&serde_json::json!([])),
+            "a caller reading endpoints must not have to tell \"none yet\" from \"unsupported\""
+        );
     }
 
     #[test]

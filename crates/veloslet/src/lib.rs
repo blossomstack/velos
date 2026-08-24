@@ -10,6 +10,7 @@ pub mod config;
 pub mod daemon;
 pub mod host;
 pub mod memory;
+pub mod proxy;
 pub mod reconcile;
 pub mod status;
 
@@ -20,6 +21,9 @@ use serde_json::Value;
 use velos_runtime::ContainerRuntime;
 
 pub use client::{ApiClient, ClientError};
+pub use proxy::{
+    LocalContainer, NodeProxy, ProxyBinding, ServicePortView, ServiceView, plan_bindings,
+};
 pub use reconcile::{
     Action, DesiredContainer, DesiredState, ObservedInstance, RestartPolicy, reconcile,
 };
@@ -253,6 +257,107 @@ pub async fn run_once(
     Ok(n)
 }
 
+// ---------------------------------------------------------------------------
+// Service proxying
+// ---------------------------------------------------------------------------
+
+/// Read a port number that has to fit a TCP port. Anything outside the range is
+/// `None` rather than truncated — a wrapped port would bind or forward to the
+/// wrong place, which is worse than not serving the port at all.
+fn port_at(doc: &Value, key: &str) -> Option<u16> {
+    u16::try_from(doc.get(key)?.as_u64()?).ok()
+}
+
+fn service_from_doc(doc: &Value) -> Option<ServiceView> {
+    let name = str_at(doc, &["metadata", "name"])?.to_string();
+    let selector = doc
+        .pointer("/spec/selector")
+        .and_then(Value::as_object)
+        .map(|m| {
+            m.iter()
+                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                .collect()
+        })
+        .unwrap_or_default();
+    let ports = doc
+        .pointer("/spec/ports")
+        .and_then(Value::as_array)
+        .map(|ports| {
+            ports
+                .iter()
+                .filter_map(|p| {
+                    Some(ServicePortView {
+                        node_port: port_at(p, "nodePort")?,
+                        target_port: port_at(p, "targetPort")?,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Some(ServiceView {
+        name,
+        selector,
+        ports,
+    })
+}
+
+/// Join the containers the server bound here with what the runtime reports, so
+/// a Service selector (which speaks labels) can reach an instance address
+/// (which only the runtime knows). The join key is the uid, as everywhere else.
+fn local_containers(
+    assigned: &[Value],
+    instances: &[velos_runtime::Instance],
+) -> Vec<LocalContainer> {
+    assigned
+        .iter()
+        .filter_map(|doc| {
+            let uid = str_at(doc, &["metadata", "uid"])?;
+            let labels = doc
+                .pointer("/metadata/labels")
+                .and_then(Value::as_object)
+                .map(|m| {
+                    m.iter()
+                        .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let ip = instances
+                .iter()
+                .find(|i| i.uid == uid)
+                .and_then(|i| i.ip.clone());
+            Some(LocalContainer { labels, ip })
+        })
+        .collect()
+}
+
+/// One service-proxy pass: converge this worker's node-port listeners onto the
+/// Services that select a container running here. Returns how many listeners
+/// should be up.
+///
+/// Kept apart from [`run_once`] on purpose. Container reconciliation and
+/// traffic forwarding fail independently — an unreachable API server must not
+/// tear down listeners that are still carrying traffic, and a port that cannot
+/// be bound must not stall the container lifecycle.
+pub async fn sync_services(
+    client: &ApiClient,
+    runtime: &dyn ContainerRuntime,
+    node: &str,
+    proxy: &NodeProxy,
+) -> Result<usize, VelosletError> {
+    let services: Vec<ServiceView> = client
+        .list_services()
+        .await?
+        .iter()
+        .filter_map(service_from_doc)
+        .collect();
+    let assigned = client.list_assigned(node).await?;
+    let instances = runtime.list().await?;
+    let plan = plan_bindings(&services, &local_containers(&assigned, &instances));
+    let n = plan.len();
+    proxy.sync(plan).await;
+    Ok(n)
+}
+
 /// Run the worker forever: heartbeat + reconcile on intervals.
 pub async fn run_loop(
     client: ApiClient,
@@ -264,11 +369,17 @@ pub async fn run_loop(
 ) {
     let mut reconcile_tick = tokio::time::interval(reconcile_interval);
     let mut heartbeat_tick = tokio::time::interval(heartbeat_interval);
+    let proxy = NodeProxy::new();
     loop {
         tokio::select! {
             _ = reconcile_tick.tick() => {
                 if let Err(e) = run_once(&client, runtime.as_ref(), &node).await {
                     tracing::warn!("reconcile failed: {e}");
+                }
+                // After reconciling, not before: a container that just started
+                // has no address until the runtime reports one.
+                if let Err(e) = sync_services(&client, runtime.as_ref(), &node, &proxy).await {
+                    tracing::warn!("service proxy sync failed: {e}");
                 }
             }
             _ = heartbeat_tick.tick() => {
