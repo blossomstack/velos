@@ -46,7 +46,7 @@ curl -fsSL https://raw.githubusercontent.com/blossomstack/velos/main/install.sh 
 
 This picks the release build for your platform (macOS or Linux, arm64 or x86_64),
 verifies it against its published SHA-256, and installs `velosctl` into
-`~/.velos/bin`. It prints an `export PATH=…` line if that directory isn't on your
+`~/.local/bin`. It prints an `export PATH=…` line if that directory isn't on your
 `PATH` yet. To pass options through the pipe, add `-s --`:
 
 ```bash
@@ -58,7 +58,7 @@ curl -fsSL https://raw.githubusercontent.com/blossomstack/velos/main/install.sh 
 | Option | Env | Default | Meaning |
 |---|---|---|---|
 | `--components` | `VELOS_COMPONENTS` | `velosctl` | comma-separated `velosctl`, `veloslet`, `velos-server`, or `all` |
-| `--bin-dir` | `VELOS_BIN_DIR` | `~/.velos/bin` | where to install |
+| `--bin-dir` | `VELOS_BIN_DIR` | `~/.local/bin` | where to install |
 | `--version` | `VELOS_VERSION` | latest release | release tag, e.g. `v0.1.3` |
 
 The script fails closed: an unsupported platform, a missing or mismatched
@@ -174,7 +174,7 @@ runtime. Every line that isn't a pass carries the command that fixes it.
 Run against a server that is up but not set up yet, it looks like this:
 
 ```
-  ✔ velosctl     v0.1.3 (/Users/you/.velos/bin/velosctl)
+  ✔ velosctl     v0.1.3 (/Users/you/.local/bin/velosctl)
   ! config file  /Users/you/.velos/config not written yet
                    → run `velosctl login --token <token> --server <url>` to save one
   ✔ server url   http://127.0.0.1:8080 (from built-in default)

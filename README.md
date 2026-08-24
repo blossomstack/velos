@@ -92,7 +92,7 @@ curl -fsSL https://raw.githubusercontent.com/blossomstack/velos/main/install.sh 
 ```
 
 That downloads the latest release for your platform, checks it against its published
-SHA-256, and installs `velosctl` into `~/.velos/bin`. Useful flags: `--components all`
+SHA-256, and installs `velosctl` into `~/.local/bin`. Useful flags: `--components all`
 (also install `velos-server` and `veloslet`), `--bin-dir /usr/local/bin`,
 `--version v0.1.3`. Prefer cargo? `cargo install velos-server velosctl veloslet`.
 Or build from source with `make build` (which also builds the embedded dashboard).

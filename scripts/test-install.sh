@@ -77,6 +77,18 @@ pass "installs the requested components"
 grep -q "not on your PATH" "$work/out.log" || fail "no PATH hint for a bin dir outside PATH"
 pass "warns when the bin dir is not on PATH"
 
+# --- the default bin dir --------------------------------------------------
+
+# HOME is redirected so the default path is exercised without touching the real
+# one — the default is a user-visible promise, not just an internal constant.
+home="$work/home"
+mkdir -p "$home"
+VELOS_DOWNLOAD_BASE="$base" HOME="$home" sh "$root/install.sh" \
+    --version "$version" >"$work/default.log" 2>&1 \
+    || fail "install with the default bin dir failed: $(cat "$work/default.log")"
+[ -x "$home/.local/bin/velosctl" ] || fail "the default bin dir is not ~/.local/bin"
+pass "installs into ~/.local/bin by default"
+
 # --- a binary that cannot run here must be rejected ------------------------
 
 broken="v9.9.8"
