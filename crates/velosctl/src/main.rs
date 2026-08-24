@@ -135,12 +135,12 @@ async fn main() -> Result<()> {
         }
         Command::Hibernate { name } => {
             let url = subresource_url(&server, "containers", &name, "hibernate");
-            let resp = client(&token, http.post(url)).send().await?;
+            let resp = client(token, http.post(url)).send().await?;
             print_json(&body_or_error(resp).await?)?;
         }
         Command::Resume { name } => {
             let url = subresource_url(&server, "containers", &name, "resume");
-            let resp = client(&token, http.post(url)).send().await?;
+            let resp = client(token, http.post(url)).send().await?;
             print_json(&body_or_error(resp).await?)?;
         }
         Command::Apply { kind, file } => {
