@@ -169,7 +169,7 @@ That downloads the latest release for your platform, checks it against its publi
 SHA-256, and installs `velosctl` (drive the control plane) and `veloslet` (join it as
 a worker) into `~/.local/bin`. Useful flags: `--components all` (also install
 `velos-server`), `--components velosctl` (just the CLI), `--bin-dir /usr/local/bin`,
-`--version v0.3.0`. Prefer cargo? `cargo install velos-server velosctl veloslet`.
+`--version v0.4.0`. Prefer cargo? `cargo install velos-server velosctl veloslet`.
 Or build from source with `make build` (which also builds the embedded dashboard).
 
 At any point, **`velosctl doctor`** checks your setup — config file, server URL,
