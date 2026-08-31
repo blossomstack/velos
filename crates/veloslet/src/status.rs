@@ -19,6 +19,7 @@ use std::process::Command;
 use std::time::Duration;
 
 use serde_json::Value;
+use velos_runtime::{AppleContainer, ContainerRuntime};
 
 use crate::daemon::{BUNDLE_ID, WorkerConfig};
 use crate::host::{HostResources, detect_host, validate_capacity};
@@ -239,6 +240,14 @@ pub enum RuntimeState {
     Absent,
     Available(String),
     Broken(String),
+    /// The CLI answers but the runtime cannot list containers — its services
+    /// are stopped or wedged. Its own state, because it is the one failure here
+    /// that an installed, correctly configured machine hits routinely, and the
+    /// one `--version` alone reads as perfect health.
+    Stopped {
+        version: String,
+        why: String,
+    },
 }
 
 /// Whether launchd is running the background worker.
@@ -399,6 +408,13 @@ fn check_runtime(state: &RuntimeState) -> Check {
             format!("`{RUNTIME_BIN}` is present but did not answer: {why}"),
             "run `container system start`",
         ),
+        RuntimeState::Stopped { version, why } => Check::fail(
+            "runtime",
+            format!("{version} is installed but cannot run containers: {why}"),
+            "run `container system start` — a running worker also tries this \
+             itself on every heartbeat, so if it keeps coming back check \
+             `container system logs`",
+        ),
     }
 }
 
@@ -502,12 +518,41 @@ fn observe_capacity(cfg: &WorkerConfig) -> CapacityState {
     }
 }
 
-fn observe_runtime() -> RuntimeState {
+/// The first line of `text`, capped so one long runtime error cannot push the
+/// rest of the report off the screen.
+fn first_line(text: &str) -> String {
+    text.lines()
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .chars()
+        .take(160)
+        .collect()
+}
+
+/// Is the runtime installed, and can it actually run containers?
+///
+/// Two probes, because they are two questions. `--version` answers from the CLI
+/// binary alone and keeps answering while the runtime's services are stopped —
+/// which is why asking it on its own let this check report a clean bill of
+/// health for a machine that could not launch a thing. The second probe is the
+/// worker's own `list` call, so what the report grades is the capability the
+/// worker actually needs.
+async fn observe_runtime() -> RuntimeState {
     match Command::new(RUNTIME_BIN).arg("--version").output() {
         Ok(out) if out.status.success() => {
             let text = String::from_utf8_lossy(&out.stdout);
-            let line = text.lines().next().unwrap_or_default().trim();
-            RuntimeState::Available(line.to_string())
+            let version = text.lines().next().unwrap_or_default().trim().to_string();
+            match AppleContainer::new().list().await {
+                Ok(_) => RuntimeState::Available(version),
+                Err(e) => RuntimeState::Stopped {
+                    version,
+                    // First line only: apple/container follows its error with
+                    // its own "run `container system start`" advice, which is
+                    // the hint this check already prints.
+                    why: first_line(&e.to_string()),
+                },
+            }
         }
         Ok(out) => RuntimeState::Broken(
             String::from_utf8_lossy(&out.stderr)
@@ -614,7 +659,7 @@ pub async fn diagnose(config_path: PathBuf) -> Report {
         for name in ["joined", "server", "reachable", "identity", "capacity"] {
             checks.push(Check::skip(name, "no usable config"));
         }
-        checks.push(check_runtime(&observe_runtime()));
+        checks.push(check_runtime(&observe_runtime().await));
         checks.push(check_agent(&observe_agent()));
         return Report { checks };
     };
@@ -641,7 +686,7 @@ pub async fn diagnose(config_path: PathBuf) -> Report {
     }
 
     checks.push(check_capacity(&observe_capacity(cfg)));
-    checks.push(check_runtime(&observe_runtime()));
+    checks.push(check_runtime(&observe_runtime().await));
     checks.push(check_agent(&observe_agent()));
     Report { checks }
 }
@@ -763,6 +808,33 @@ mod tests {
         ));
         assert_eq!(check.status, Status::Fail);
         assert!(check.detail.contains("99"), "{}", check.detail);
+    }
+
+    #[test]
+    fn an_installed_runtime_that_cannot_run_containers_fails_the_report() {
+        // The false green this exists to kill: `container --version` answers off
+        // the CLI binary, so a machine whose runtime services are stopped used
+        // to read as a clean bill of health and `veloslet status` exited 0.
+        let check = check_runtime(&RuntimeState::Stopped {
+            version: "container CLI version 1.0.0".to_string(),
+            why: "the runtime service is not running".to_string(),
+        });
+        assert_eq!(check.status, Status::Fail);
+        assert!(
+            check.detail.contains("cannot run containers"),
+            "{}",
+            check.detail
+        );
+        assert!(check.hint.unwrap().contains("container system start"));
+        assert!(
+            Report {
+                checks: vec![check_runtime(&RuntimeState::Stopped {
+                    version: "container CLI version 1.0.0".to_string(),
+                    why: "down".to_string(),
+                })]
+            }
+            .has_failures()
+        );
     }
 
     #[test]

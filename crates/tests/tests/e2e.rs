@@ -5,6 +5,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use velos_runtime::{ContainerRuntime, FakeRuntime};
 use velos_server::{app, controllers};
@@ -220,6 +221,92 @@ async fn a_container_that_cannot_launch_does_not_block_its_neighbours() {
     assert_eq!(broken["status"]["reason"], "StartFailed");
     let healthy = get_container(&http, &base, "healthy").await;
     assert_eq!(healthy["status"]["phase"], "Running");
+}
+
+/// A worker's lease is its claim that it can run containers, so it must not
+/// renew one while its runtime is down.
+///
+/// Without the gate the worker kept heartbeating through a dead runtime, stayed
+/// Ready, and the scheduler kept binding containers to a machine that could not
+/// launch a single one of them.
+#[tokio::test]
+async fn a_worker_whose_runtime_is_down_stops_claiming_to_be_ready() {
+    let (base, store) = start().await;
+    let http = reqwest::Client::new();
+    post_ready_worker(&http, &base, "w1").await;
+    let client = ApiClient::new(&base, None);
+
+    // A healthy runtime heartbeats, and the control plane reads that as Ready.
+    let runtime = FakeRuntime::new();
+    assert!(veloslet::heartbeat(&client, &runtime, "w1", 40).await);
+    controllers::reconcile_node_lifecycle(
+        store.as_ref(),
+        chrono::Utc::now(),
+        Duration::from_secs(300),
+    )
+    .unwrap();
+    assert!(worker_is_ready(&http, &base, "w1").await);
+
+    // The runtime service goes down for good. The worker withholds the claim,
+    // and the lease it wrote earlier goes stale on its own.
+    runtime.take_down(false).unwrap();
+    assert!(!veloslet::heartbeat(&client, &runtime, "w1", 40).await);
+    let past_the_lease = chrono::Utc::now() + chrono::Duration::seconds(120);
+    controllers::reconcile_node_lifecycle(store.as_ref(), past_the_lease, Duration::from_secs(300))
+        .unwrap();
+    assert!(
+        !worker_is_ready(&http, &base, "w1").await,
+        "a worker that cannot run containers must not be Ready"
+    );
+}
+
+/// The other half: the worker restarts a runtime it can restart, rather than
+/// waiting for an operator to notice a Mac whose container services stopped.
+#[tokio::test]
+async fn a_worker_restarts_a_runtime_it_can_restart_and_keeps_heartbeating() {
+    let (base, _store) = start().await;
+    let http = reqwest::Client::new();
+    post_ready_worker(&http, &base, "w1").await;
+    let client = ApiClient::new(&base, None);
+
+    let runtime = FakeRuntime::new();
+    runtime.take_down(true).unwrap();
+    assert!(runtime.list().await.is_err(), "the runtime really is down");
+
+    assert!(
+        veloslet::heartbeat(&client, &runtime, "w1", 40).await,
+        "the heartbeat should have brought the runtime back and then renewed"
+    );
+    assert!(runtime.list().await.is_ok(), "the runtime is usable again");
+    let lease = http
+        .get(format!("{base}/api/v1/leases/w1"))
+        .send()
+        .await
+        .unwrap()
+        .json::<serde_json::Value>()
+        .await
+        .unwrap();
+    assert_eq!(lease["spec"]["holderIdentity"], "w1");
+}
+
+/// Whether the control plane currently considers `name` Ready.
+async fn worker_is_ready(http: &reqwest::Client, base: &str, name: &str) -> bool {
+    let w = http
+        .get(format!("{base}/api/v1/workers/{name}"))
+        .send()
+        .await
+        .unwrap()
+        .json::<serde_json::Value>()
+        .await
+        .unwrap();
+    w["status"]["conditions"]
+        .as_array()
+        .map(|cs| {
+            cs.iter().any(|c| {
+                c["conditionType"] == "Ready" && c["status"] == serde_json::Value::Bool(true)
+            })
+        })
+        .unwrap_or(false)
 }
 
 /// A Service must turn into a port on the worker that actually carries traffic

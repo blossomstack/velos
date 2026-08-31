@@ -258,6 +258,12 @@ Nothing is written unless the join succeeds, so a failed `setup` leaves the
 machine exactly as it was — there is no half-joined config for `run` to puzzle
 over.
 
+Before each heartbeat the worker checks that its container runtime can actually
+run containers, and restarts Apple's `container` services if they are not up. A
+runtime it cannot bring back means it stops renewing its lease and goes
+`NotReady`, so the scheduler stops sending it work rather than filling it with
+containers that would never launch. `veloslet status` reports the same thing.
+
 Within a few seconds the worker reports **Ready** (its lease is fresh):
 
 ```bash

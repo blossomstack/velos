@@ -192,6 +192,12 @@ async fn setup(args: SetupArgs) -> Result<()> {
     validate_capacity(cfg.cpu, cfg.memory, host)?;
 
     let runtime = AppleContainer::new();
+    // Before reading the version, not after: a Mac that has just rebooted has
+    // the CLI on PATH and its services down, and registering is the moment this
+    // worker advertises what it can do.
+    if let Err(e) = runtime.ensure_ready().await {
+        tracing::warn!("container runtime is not usable: {e}");
+    }
     let runtime_version = runtime
         .version()
         .await
@@ -302,6 +308,12 @@ async fn run(path: PathBuf) -> Result<()> {
     let bearer = cfg.bearer()?;
 
     let runtime = AppleContainer::new();
+    // Before reading the version, not after: a Mac that has just rebooted has
+    // the CLI on PATH and its services down, and registering is the moment this
+    // worker advertises what it can do.
+    if let Err(e) = runtime.ensure_ready().await {
+        tracing::warn!("container runtime is not usable: {e}");
+    }
     let runtime_version = runtime
         .version()
         .await

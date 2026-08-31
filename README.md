@@ -51,7 +51,8 @@ under `/api/v1/{plural}`:
   parked in `Hibernated` — see [Hibernation](#hibernation).
 - **Worker** — a registered machine, with its capacity and a `Ready` condition.
 - **Lease** — a worker's periodic heartbeat; a stale lease marks its worker
-  `NotReady`.
+  `NotReady`. A worker only renews it while its container runtime can actually
+  run containers — see [Worker health](#worker-health).
 - **Service** — a stable port in front of the containers a label selector picks
   out, wherever they are running — see [Services](#services).
 
@@ -156,6 +157,25 @@ bound, the placement is recorded in `status.workerName` and never re-evaluated.
   "tolerations": [ { "key": "gpu", "operator": "Exists" } ]
 }
 ```
+
+## Worker health
+
+A worker's lease is a claim that its machine can run containers, so `veloslet`
+checks that before every heartbeat rather than assuming it. The `container` CLI
+being installed is not the same question: Apple's container services are a
+launchd job that a reboot, a crash, or `container system stop` can take away
+while the CLI keeps answering `--version` quite happily.
+
+So on each heartbeat the worker asks the runtime to list its containers, and:
+
+- if that works, it renews its lease as usual;
+- if it does not, the worker restarts the runtime's services and tries again;
+- if the runtime still cannot answer, the worker **stops renewing** and goes
+  `NotReady`. The scheduler then places nothing new on it, and its containers are
+  rescheduled once it has been `NotReady` past the eviction window.
+
+`veloslet status` runs the same check, so a machine whose runtime is down reports
+a failed `runtime` line and exits non-zero instead of a clean bill of health.
 
 ## Getting started
 

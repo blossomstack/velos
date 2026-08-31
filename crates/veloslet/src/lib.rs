@@ -439,6 +439,41 @@ pub async fn sync_services(
     Ok(n)
 }
 
+/// One heartbeat: confirm this worker can actually run containers, and only
+/// then renew its lease. Returns whether the lease was renewed.
+///
+/// The lease is not a formality, it is a claim. The server derives worker
+/// readiness from its freshness, the scheduler places containers on Ready
+/// workers, and containers on a worker that stops renewing are rescheduled
+/// elsewhere. So a worker whose runtime is down must not renew: it would keep
+/// drawing containers it cannot launch, and every one of them would sit in
+/// `Scheduled` behind a green worker. Going NotReady is the honest answer, and
+/// the one that gets the work run somewhere it can run.
+///
+/// [`ensure_ready`] repairs before it reports, because on a Mac worker the
+/// usual reason the runtime is down is that Apple's `container` services are
+/// not running — a launchd job that a reboot, a crash, or `container system
+/// stop` can take away underneath an otherwise perfectly healthy worker.
+/// Restarting them is this daemon's job, not an operator's.
+///
+/// [`ensure_ready`]: ContainerRuntime::ensure_ready
+pub async fn heartbeat(
+    client: &ApiClient,
+    runtime: &dyn ContainerRuntime,
+    node: &str,
+    lease_duration_secs: u32,
+) -> bool {
+    if let Err(e) = runtime.ensure_ready().await {
+        tracing::warn!("runtime unusable, withholding this worker's heartbeat: {e}");
+        return false;
+    }
+    if let Err(e) = client.renew_lease(node, lease_duration_secs).await {
+        tracing::warn!("lease renew failed: {e}");
+        return false;
+    }
+    true
+}
+
 /// Run the worker forever: heartbeat + reconcile on intervals.
 pub async fn run_loop(
     client: ApiClient,
@@ -450,6 +485,12 @@ pub async fn run_loop(
 ) {
     let mut reconcile_tick = tokio::time::interval(reconcile_interval);
     let mut heartbeat_tick = tokio::time::interval(heartbeat_interval);
+    // A heartbeat that has to restart the container runtime can outlast a
+    // reconcile interval. The default behaviour would then fire every tick it
+    // missed back-to-back, hammering a runtime that just came up; `Delay`
+    // simply resumes the cadence from now.
+    reconcile_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    heartbeat_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let proxy = NodeProxy::new();
     loop {
         tokio::select! {
@@ -464,9 +505,7 @@ pub async fn run_loop(
                 }
             }
             _ = heartbeat_tick.tick() => {
-                if let Err(e) = client.renew_lease(&node, lease_duration_secs).await {
-                    tracing::warn!("lease renew failed: {e}");
-                }
+                heartbeat(&client, runtime.as_ref(), &node, lease_duration_secs).await;
             }
         }
     }

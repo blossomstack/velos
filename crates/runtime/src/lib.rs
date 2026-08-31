@@ -81,6 +81,22 @@ pub trait ContainerRuntime: Send + Sync {
     async fn list(&self) -> Result<Vec<Instance>, RuntimeError>;
     /// Reported runtime version string (for `WorkerStatus`).
     async fn version(&self) -> Result<String, RuntimeError>;
+
+    /// Whether this runtime can run containers right now — bringing it back up
+    /// first if this backend knows how.
+    ///
+    /// The worker calls this before every heartbeat, because the heartbeat is a
+    /// claim that this machine can run containers. Being *installed* is not that
+    /// claim: a runtime is typically a daemon that can be stopped, crash, or
+    /// never start after a reboot while its CLI sits on `PATH` answering
+    /// `--version` perfectly happily.
+    ///
+    /// The default is the honest minimum for a backend with nothing to restart:
+    /// ask it to `list`, the one call every other method depends on. A backend
+    /// that owns a restartable service overrides this to restart it.
+    async fn ensure_ready(&self) -> Result<(), RuntimeError> {
+        self.list().await.map(|_| ())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -99,6 +115,15 @@ pub struct FakeRuntime {
     /// should be able to break one container while leaving its neighbours on
     /// the same worker launchable.
     run_failures: Mutex<HashMap<String, String>>,
+    /// The runtime service being down, and whether `ensure_ready` can bring it
+    /// back. `None` is up. See [`FakeRuntime::take_down`].
+    down: Mutex<Option<Down>>,
+}
+
+/// A downed fake runtime: down, and either repairable or not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Down {
+    repairable: bool,
 }
 
 impl Default for FakeRuntime {
@@ -110,6 +135,7 @@ impl Default for FakeRuntime {
             // instance and drive traffic through the worker's service proxy.
             instance_ip: "127.0.0.1".to_string(),
             run_failures: Mutex::new(HashMap::new()),
+            down: Mutex::new(None),
         }
     }
 }
@@ -144,6 +170,28 @@ impl FakeRuntime {
         Ok(())
     }
 
+    /// Take the runtime service down, the way a stopped or crashed container
+    /// daemon goes down: every call that needs it fails, while `version` keeps
+    /// answering — an installed CLI does not stop existing.
+    ///
+    /// `repairable` is the difference between the two cases a worker must tell
+    /// apart: a service `ensure_ready` can restart, and one it cannot, where the
+    /// only correct move is to stop claiming this machine can run containers.
+    pub fn take_down(&self, repairable: bool) -> Result<(), RuntimeError> {
+        *self.down.lock().map_err(|_| RuntimeError::Lock)? = Some(Down { repairable });
+        Ok(())
+    }
+
+    /// Fail if the runtime service is down.
+    fn check_up(&self) -> Result<(), RuntimeError> {
+        match *self.down.lock().map_err(|_| RuntimeError::Lock)? {
+            Some(_) => Err(RuntimeError::Command(
+                "the runtime service is not running".to_string(),
+            )),
+            None => Ok(()),
+        }
+    }
+
     /// Simulate the instance for `uid` exiting with `exit_code`.
     pub fn set_exited(&self, uid: &str, exit_code: i32) -> Result<(), RuntimeError> {
         let mut g = self.instances.lock().map_err(|_| RuntimeError::Lock)?;
@@ -157,6 +205,7 @@ impl FakeRuntime {
 #[async_trait]
 impl ContainerRuntime for FakeRuntime {
     async fn run(&self, spec: &RunSpec) -> Result<InstanceId, RuntimeError> {
+        self.check_up()?;
         if let Some(message) = self
             .run_failures
             .lock()
@@ -189,6 +238,7 @@ impl ContainerRuntime for FakeRuntime {
     }
 
     async fn start(&self, uid: &str) -> Result<InstanceId, RuntimeError> {
+        self.check_up()?;
         let mut g = self.instances.lock().map_err(|_| RuntimeError::Lock)?;
         match g.get_mut(uid) {
             Some(inst) => {
@@ -206,6 +256,7 @@ impl ContainerRuntime for FakeRuntime {
     }
 
     async fn list(&self) -> Result<Vec<Instance>, RuntimeError> {
+        self.check_up()?;
         let g = self.instances.lock().map_err(|_| RuntimeError::Lock)?;
         Ok(g.values()
             .cloned()
@@ -221,8 +272,20 @@ impl ContainerRuntime for FakeRuntime {
             .collect())
     }
 
+    /// Answers even while the service is down: `container --version` does too,
+    /// which is exactly why it is not a health check.
     async fn version(&self) -> Result<String, RuntimeError> {
         Ok("fake-runtime/1.0".to_string())
+    }
+
+    async fn ensure_ready(&self) -> Result<(), RuntimeError> {
+        {
+            let mut down = self.down.lock().map_err(|_| RuntimeError::Lock)?;
+            if down.map(|d| d.repairable).unwrap_or(false) {
+                *down = None;
+            }
+        }
+        self.list().await.map(|_| ())
     }
 }
 
@@ -242,6 +305,7 @@ impl ContainerRuntime for FakeRuntime {
 //   remove  : `container delete --force velos-<uid>`
 //   list    : `container list --all --format json`
 //   version : `container --version`
+//   repair  : `container system start --disable-kernel-install --timeout <secs>`
 //
 // These match the apple/container 1.0 command reference (`delete` has alias
 // `rm`, `list` has alias `ls`). If your installed version differs, this is the
@@ -257,6 +321,11 @@ const SUBCMD_STOP: &str = "stop";
 const SUBCMD_START: &str = "start";
 const SUBCMD_REMOVE: &str = "delete";
 const SUBCMD_LIST: &str = "list";
+const SUBCMD_SYSTEM: &str = "system";
+/// Seconds `container system start` may wait for the API service to answer.
+/// Bounded because it runs on the worker's heartbeat path: a service that is
+/// wedged rather than stopped must not hold the heartbeat open indefinitely.
+const SYSTEM_START_TIMEOUT_SECS: u32 = 15;
 /// Prefix applied to a uid to form the runtime instance name.
 const NAME_PREFIX: &str = "velos-";
 
@@ -295,6 +364,22 @@ fn build_run_args(name: &str, spec: &RunSpec) -> Vec<String> {
         None => args.push(spec.image.clone()),
     }
     args
+}
+
+/// Build the `container system start …` argv (pure, so it's unit-testable).
+///
+/// `--disable-kernel-install` because this is a *repair*, not an install. The
+/// flag suppresses a prompt that, under launchd, has nobody to answer it, and a
+/// machine whose default kernel was never installed needs an operator — not a
+/// worker quietly downloading one in the middle of a heartbeat.
+fn build_system_start_args() -> Vec<String> {
+    vec![
+        SUBCMD_SYSTEM.to_string(),
+        SUBCMD_START.to_string(),
+        "--disable-kernel-install".to_string(),
+        "--timeout".to_string(),
+        SYSTEM_START_TIMEOUT_SECS.to_string(),
+    ]
 }
 
 /// Real backend: shells out to the `container` CLI via `tokio::process`.
@@ -400,6 +485,29 @@ impl ContainerRuntime for AppleContainer {
 
     async fn version(&self) -> Result<String, RuntimeError> {
         self.output(&["--version".to_string()]).await
+    }
+
+    /// Probe, and restart Apple's `container` services if the probe fails.
+    ///
+    /// `list` is the probe rather than `container system status`: it is the call
+    /// the worker actually depends on, so it answers the only question that
+    /// matters — not "does a service claim to be up" but "can this machine run
+    /// containers". A restart that leaves it still unable to list is a failure,
+    /// and the worker withholds its heartbeat on the strength of that.
+    async fn ensure_ready(&self) -> Result<(), RuntimeError> {
+        let Err(down) = self.list().await else {
+            return Ok(());
+        };
+        tracing::warn!("container runtime is not answering ({down}); restarting its services");
+        self.output(&build_system_start_args()).await.map_err(|e| {
+            RuntimeError::Command(format!("{down}; `{} system start` failed: {e}", self.bin))
+        })?;
+        self.list().await.map(|_| ()).map_err(|e| {
+            RuntimeError::Command(format!(
+                "`{} system start` returned but the runtime still does not answer: {e}",
+                self.bin
+            ))
+        })
     }
 }
 
@@ -702,6 +810,49 @@ mod tests {
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].uid, "u1");
         assert_eq!(got[0].state, InstanceState::Running);
+    }
+
+    #[tokio::test]
+    async fn a_down_runtime_is_not_ready_and_a_repairable_one_comes_back() {
+        let rt = FakeRuntime::new();
+        assert!(rt.ensure_ready().await.is_ok());
+
+        // Down but restartable: `ensure_ready` brings it back and the worker
+        // carries on, which is the whole point of asking before heartbeating.
+        rt.take_down(true).unwrap();
+        assert!(rt.list().await.is_err());
+        assert!(rt.ensure_ready().await.is_ok());
+        assert!(rt.list().await.is_ok());
+
+        // Down for good: no verdict but "not ready".
+        rt.take_down(false).unwrap();
+        assert!(rt.ensure_ready().await.is_err());
+        assert!(rt.ensure_ready().await.is_err(), "and it stays not ready");
+    }
+
+    #[tokio::test]
+    async fn a_down_runtime_still_reports_its_version() {
+        // The trap the health check exists for: the CLI answers `--version` from
+        // its own binary, so a version string is never evidence that anything
+        // can run.
+        let rt = FakeRuntime::new();
+        rt.take_down(false).unwrap();
+        assert!(rt.version().await.is_ok());
+        assert!(rt.ensure_ready().await.is_err());
+    }
+
+    #[test]
+    fn system_start_never_prompts_and_never_waits_forever() {
+        let args = build_system_start_args();
+        assert_eq!(args[0..2], ["system", "start"]);
+        // Under launchd there is nobody to answer a kernel-install prompt, and
+        // this runs on the heartbeat path, so an unbounded wait would hold the
+        // worker's own liveness signal open.
+        assert!(
+            args.contains(&"--disable-kernel-install".to_string()),
+            "{args:?}"
+        );
+        assert!(args.contains(&"--timeout".to_string()), "{args:?}");
     }
 
     #[test]
