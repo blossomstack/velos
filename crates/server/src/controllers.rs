@@ -765,7 +765,12 @@ pub fn endpoints_for(
     for c in containers {
         // Only a running container answers. A `Pending` one has no worker, and a
         // `Hibernated` one has a worker but nothing listening behind it.
-        if phase(&c.document) != Some("Running") || !selected(selector, &c.labels) {
+        if c.document
+            .pointer("/spec/workload")
+            .is_some_and(|v| !v.is_null())
+            || phase(&c.document) != Some("Running")
+            || !selected(selector, &c.labels)
+        {
             continue;
         }
         let Some(worker) = worker_name(&c.document) else {
@@ -1020,6 +1025,17 @@ mod tests {
             "the unselected container must not appear"
         );
         assert!(got.iter().all(|e| e.node_port == 31000));
+    }
+
+    #[test]
+    fn native_workloads_never_publish_nodeports() {
+        let svc = service_obj("web", &[("app", "web")], &[31000]);
+        let mut native = labelled_container("native", "Running", Some("w1"), &[("app", "web")]);
+        native.document["spec"]["workload"] =
+            serde_json::json!({"type":"NativeProcess","object":{"profile":"model"}});
+        let addresses = worker_addresses(&[addressed_worker("w1", Some("192.168.68.51"))]);
+        let (endpoints, _) = endpoints_for(&svc.document, &[native], &addresses);
+        assert!(endpoints.is_empty());
     }
 
     #[test]

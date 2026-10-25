@@ -6,9 +6,14 @@
 //! its Velos container **uid**, which makes actuation idempotent: reconcile after a
 //! crash matches existing instances by uid before launching.
 //!
-//! Backends today: [`AppleContainer`] (real) and [`FakeRuntime`] (tests). A Linux
+//! Backends: [`AppleContainer`], opt-in [`native::NativeProcess`], and
+//! [`FakeRuntime`] for tests. [`dispatch::MixedRuntime`] routes explicit workload
+//! types on a worker configured for both backends. A Linux
 //! backend (e.g. via `podman`/`runc` or a `libkrun` micro-VM) is the planned next
 //! addition behind this same trait — tracked separately, not in this change.
+
+pub mod dispatch;
+pub mod native;
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -32,11 +37,28 @@ pub struct InstanceId(pub String);
 
 /// What `veloslet` asks the runtime to launch.
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Workload {
+    Container { image: String },
+    NativeProcess { profile: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunSpec {
     pub uid: String,
-    pub image: String,
+    pub workload: Workload,
     pub command: Vec<String>,
     pub env: Vec<(String, String)>,
+}
+
+impl RunSpec {
+    fn container_image(&self) -> Result<&str, RuntimeError> {
+        match &self.workload {
+            Workload::Container { image } => Ok(image),
+            Workload::NativeProcess { .. } => Err(RuntimeError::Command(
+                "native workload requires an enabled native runtime".into(),
+            )),
+        }
+    }
 }
 
 /// Observed liveness of an instance. There is no "assumed running": an instance
@@ -61,6 +83,14 @@ pub struct Instance {
     pub ip: Option<String>,
 }
 
+/// Application readiness is separate from process liveness. None means no
+/// readiness contract was configured, never an assumed success.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkloadHealth {
+    pub uid: String,
+    pub ready: Option<bool>,
+}
+
 #[async_trait]
 pub trait ContainerRuntime: Send + Sync {
     /// Launch an instance tagged with `spec.uid`. Idempotent callers check
@@ -81,6 +111,16 @@ pub trait ContainerRuntime: Send + Sync {
     async fn list(&self) -> Result<Vec<Instance>, RuntimeError>;
     /// Reported runtime version string (for `WorkerStatus`).
     async fn version(&self) -> Result<String, RuntimeError>;
+
+    async fn health(&self) -> Result<Vec<WorkloadHealth>, RuntimeError> {
+        Ok(vec![])
+    }
+
+    /// Release worker-owned children on orderly shutdown. Independent container
+    /// instances preserve their existing lifecycle.
+    async fn shutdown(&self) -> Result<(), RuntimeError> {
+        Ok(())
+    }
 
     /// Whether this runtime can run containers right now — bringing it back up
     /// first if this backend knows how.
@@ -206,11 +246,12 @@ impl FakeRuntime {
 impl ContainerRuntime for FakeRuntime {
     async fn run(&self, spec: &RunSpec) -> Result<InstanceId, RuntimeError> {
         self.check_up()?;
+        spec.container_image()?;
         if let Some(message) = self
             .run_failures
             .lock()
             .map_err(|_| RuntimeError::Lock)?
-            .get(&spec.image)
+            .get(spec.container_image()?)
         {
             return Err(RuntimeError::Command(message.clone()));
         }
@@ -343,7 +384,8 @@ fn instance_name(uid: &str) -> String {
 ///
 /// Without this, any image carrying an `ENTRYPOINT` would run `ENTRYPOINT +
 /// command` instead of `command` (see issue #47).
-fn build_run_args(name: &str, spec: &RunSpec) -> Vec<String> {
+fn build_run_args(name: &str, spec: &RunSpec) -> Result<Vec<String>, RuntimeError> {
+    let image = spec.container_image()?;
     let mut args = vec![
         SUBCMD_RUN.to_string(),
         "--detach".to_string(),
@@ -358,12 +400,12 @@ fn build_run_args(name: &str, spec: &RunSpec) -> Vec<String> {
         Some((entrypoint, rest)) => {
             args.push("--entrypoint".to_string());
             args.push(entrypoint.clone());
-            args.push(spec.image.clone());
+            args.push(image.to_string());
             args.extend(rest.iter().cloned());
         }
-        None => args.push(spec.image.clone()),
+        None => args.push(image.to_string()),
     }
-    args
+    Ok(args)
 }
 
 /// Build the `container system start …` argv (pure, so it's unit-testable).
@@ -442,8 +484,9 @@ impl AppleContainer {
 #[async_trait]
 impl ContainerRuntime for AppleContainer {
     async fn run(&self, spec: &RunSpec) -> Result<InstanceId, RuntimeError> {
+        spec.container_image()?;
         let name = instance_name(&spec.uid);
-        let args = build_run_args(&name, spec);
+        let args = build_run_args(&name, spec)?;
         self.output(&args).await?;
         Ok(InstanceId(name))
     }
@@ -613,7 +656,9 @@ mod tests {
     fn spec(uid: &str) -> RunSpec {
         RunSpec {
             uid: uid.to_string(),
-            image: "alpine".to_string(),
+            workload: Workload::Container {
+                image: "alpine".to_string(),
+            },
             command: vec![],
             env: vec![],
         }
@@ -707,7 +752,7 @@ mod tests {
     #[test]
     fn run_args_without_command_use_image_entrypoint() {
         // No command → don't override; let the image's own ENTRYPOINT/CMD run.
-        let got = build_run_args("velos-u1", &spec("u1"));
+        let got = build_run_args("velos-u1", &spec("u1")).unwrap();
         assert_eq!(got, vec!["run", "--detach", "--name", "velos-u1", "alpine"]);
     }
 
@@ -722,7 +767,7 @@ mod tests {
             "-c".to_string(),
             "echo HI".to_string(),
         ];
-        let got = build_run_args("velos-u1", &s);
+        let got = build_run_args("velos-u1", &s).unwrap();
         assert_eq!(
             got,
             vec![
@@ -743,7 +788,7 @@ mod tests {
     fn run_args_single_element_command_overrides_entrypoint_with_no_trailing_args() {
         let mut s = spec("u1");
         s.command = vec!["sleep-forever".to_string()];
-        let got = build_run_args("velos-u1", &s);
+        let got = build_run_args("velos-u1", &s).unwrap();
         assert_eq!(
             got,
             vec![
@@ -763,7 +808,7 @@ mod tests {
         let mut s = spec("u1");
         s.env = vec![("K".to_string(), "V".to_string())];
         s.command = vec!["cmd".to_string()];
-        let got = build_run_args("velos-u1", &s);
+        let got = build_run_args("velos-u1", &s).unwrap();
         assert_eq!(
             got,
             vec![

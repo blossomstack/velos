@@ -80,7 +80,18 @@ struct Toleration {
     effect: Option<TaintEffect>,
 }
 
+struct NativeProcessRef {
+    profile: String,
+}
+
+#[type_tag = "type"]
+#[content_tag = "object"]
+union NativeWorkload {
+    NativeProcess(NativeProcessRef),
+}
+
 struct ContainerSpec {
+    workload: Option<NativeWorkload>,
     image: String,
     command: Vec<String>,
     env: Map<String, String>,
@@ -94,6 +105,7 @@ struct ContainerSpec {
 }
 
 struct ContainerStatus {
+    ready: Option<bool>,
     phase: ContainerPhase,
     worker_name: Option<String>,
     container_id: Option<String>,

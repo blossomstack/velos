@@ -107,6 +107,12 @@ pub enum JoinError {
 /// expired token can never strand a worker that has already joined.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkerConfig {
+    /// Opt-in native profiles; absent preserves Apple Containerization.
+    #[serde(
+        default,
+        skip_serializing_if = "velos_runtime::dispatch::RuntimeConfig::is_container"
+    )]
+    pub runtime: velos_runtime::dispatch::RuntimeConfig,
     /// Server base URL, e.g. `http://192.168.68.60:8088`.
     pub server: String,
     /// This worker's name.
@@ -275,6 +281,7 @@ mod tests {
     /// A config as `veloslet config`/`setup` writes it before the join lands.
     fn unjoined() -> WorkerConfig {
         WorkerConfig {
+            runtime: Default::default(),
             server: "http://192.168.68.60:8088".to_string(),
             node: "node-a".to_string(),
             credential: None,

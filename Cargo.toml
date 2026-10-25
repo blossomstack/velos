@@ -12,6 +12,7 @@ repository = "https://github.com/blossomstack/velos"
 # Internal crates carry both `path` (for local builds) and `version` (required so
 # crates.io can record an exact dependency when publishing).
 [workspace.dependencies]
+velos-models = { path = "crates/models", version = "0.4.0" }
 velos-store = { path = "crates/store", version = "0.4.0" }
 velos-scheduler = { path = "crates/scheduler", version = "0.4.0" }
 velos-runtime = { path = "crates/runtime", version = "0.4.0" }

@@ -23,6 +23,7 @@
 //! no replica refuses the connection and drops out of rotation on its own.
 
 use std::collections::HashMap;
+use std::net::Ipv4Addr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -156,12 +157,27 @@ impl Drop for Listener {
 }
 
 /// The set of node-port listeners this worker is running.
-#[derive(Default)]
 pub struct NodeProxy {
+    bind_ip: Ipv4Addr,
     listeners: Mutex<HashMap<u16, Listener>>,
 }
 
+impl Default for NodeProxy {
+    fn default() -> Self {
+        Self::with_bind_ip(Ipv4Addr::UNSPECIFIED)
+    }
+}
+
 impl NodeProxy {
+    /// Restrict listeners to an interface, e.g. loopback for isolated tests.
+    /// The default constructor preserves existing all-interface NodePorts.
+    pub fn with_bind_ip(bind_ip: Ipv4Addr) -> Self {
+        Self {
+            bind_ip,
+            listeners: Mutex::new(HashMap::new()),
+        }
+    }
+
     pub fn new() -> Self {
         Self::default()
     }
@@ -208,7 +224,7 @@ impl NodeProxy {
                     // value is harmless and a skipped one would be a stale route.
                     let _ = live.backends.send(binding.backends);
                 }
-                None => match TcpListener::bind(("0.0.0.0", binding.node_port)).await {
+                None => match TcpListener::bind((self.bind_ip, binding.node_port)).await {
                     Ok(socket) => {
                         let (tx, rx) = watch::channel(binding.backends.clone());
                         let service = binding.service.clone();
@@ -390,27 +406,28 @@ mod tests {
 
     #[tokio::test]
     async fn sync_binds_stops_and_rebuilds_on_reassignment() {
-        let proxy = NodeProxy::new();
+        let port = free_port().await;
+        let proxy = NodeProxy::with_bind_ip(Ipv4Addr::LOCALHOST);
         proxy
             .sync(vec![ProxyBinding {
-                node_port: 31111,
+                node_port: port,
                 service: "web".to_string(),
                 backends: vec!["127.0.0.1:9".to_string()],
             }])
             .await;
-        assert_eq!(proxy.bound_ports().await, vec![31111]);
+        assert_eq!(proxy.bound_ports().await, vec![port]);
 
         // Same port, different owner → the old listener must go, or the new
         // Service silently inherits the previous one's routes.
         proxy
             .sync(vec![ProxyBinding {
-                node_port: 31111,
+                node_port: port,
                 service: "api".to_string(),
                 backends: vec!["127.0.0.1:9".to_string()],
             }])
             .await;
         let held = proxy.listeners.lock().await;
-        assert_eq!(held.get(&31111).map(|l| l.service.as_str()), Some("api"));
+        assert_eq!(held.get(&port).map(|l| l.service.as_str()), Some("api"));
         drop(held);
 
         proxy.sync(Vec::new()).await;
@@ -430,7 +447,7 @@ mod tests {
         });
 
         let node_port = free_port().await;
-        let proxy = NodeProxy::new();
+        let proxy = NodeProxy::with_bind_ip(Ipv4Addr::LOCALHOST);
         proxy
             .sync(vec![ProxyBinding {
                 node_port,

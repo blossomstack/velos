@@ -124,7 +124,9 @@ async fn real_container_lifecycle_with_apple_containerization() {
         let probe = AppleContainer::new();
         let spec = RunSpec {
             uid: "preflight".to_string(),
-            image: IMAGE.to_string(),
+            workload: velos_runtime::Workload::Container {
+                image: IMAGE.to_string(),
+            },
             command: vec!["true".to_string()],
             env: vec![],
         };

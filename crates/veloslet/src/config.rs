@@ -105,6 +105,10 @@ pub fn resolve_setup(fields: Edits, existing: Option<WorkerConfig>) -> Result<Wo
     // ever drifted apart.
     let required = |name: &str| anyhow::anyhow!("{name} is required");
     Ok(WorkerConfig {
+        runtime: existing
+            .as_ref()
+            .map(|c| c.runtime.clone())
+            .unwrap_or_default(),
         server: fields
             .server
             .or_else(|| existing.as_ref().map(|b| b.server.clone()))
@@ -322,6 +326,7 @@ mod tests {
 
     fn base() -> WorkerConfig {
         WorkerConfig {
+            runtime: Default::default(),
             server: "http://h:8088".to_string(),
             node: "node-a".to_string(),
             credential: None,

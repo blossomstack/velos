@@ -22,6 +22,7 @@ name = "velos-server"
 path = "src/main.rs"
 
 [dependencies]
+velos-runtime = { workspace = true }
 velos-store = { workspace = true }
 velos-scheduler = { workspace = true }
 velos-auth = { workspace = true }

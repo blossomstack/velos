@@ -686,7 +686,33 @@ pub async fn diagnose(config_path: PathBuf) -> Report {
     }
 
     checks.push(check_capacity(&observe_capacity(cfg)));
-    checks.push(check_runtime(&observe_runtime().await));
+    match &cfg.runtime {
+        velos_runtime::dispatch::RuntimeConfig::AppleContainer => {
+            checks.push(check_runtime(&observe_runtime().await))
+        }
+        velos_runtime::dispatch::RuntimeConfig::NativeProcess(config)
+        | velos_runtime::dispatch::RuntimeConfig::Mixed(config) => {
+            match config.validate() {
+                Ok(()) => checks.push(Check::pass(
+                    "native configuration",
+                    "valid; runtime ownership and process liveness are reported by the worker"
+                        .to_string(),
+                )),
+                Err(e) => checks.push(Check::fail(
+                    "native configuration",
+                    e.to_string(),
+                    "fix the runtime configuration",
+                )),
+            }
+            if matches!(
+                &cfg.runtime,
+                velos_runtime::dispatch::RuntimeConfig::Mixed(_)
+            ) {
+                checks.push(check_runtime(&observe_runtime().await));
+            }
+        }
+    }
+
     checks.push(check_agent(&observe_agent()));
     Report { checks }
 }
@@ -698,6 +724,7 @@ mod tests {
 
     fn cfg() -> WorkerConfig {
         WorkerConfig {
+            runtime: Default::default(),
             server: "http://h:8088".to_string(),
             node: "node-a".to_string(),
             credential: Some("node-a.secret".to_string()),

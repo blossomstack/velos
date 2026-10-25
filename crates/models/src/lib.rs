@@ -41,6 +41,7 @@ impl Container {
         Container::new(
             ObjectMeta::new_named(name),
             ContainerSpec::new(
+                None, // workload: legacy container
                 image.into(),
                 Vec::new(),
                 HashMap::new(),
@@ -53,6 +54,7 @@ impl Container {
                 Vec::new(),     // tolerations
             ),
             ContainerStatus::new(
+                None, // application readiness unknown
                 ContainerPhase::Pending,
                 None, // worker_name
                 None, // container_id

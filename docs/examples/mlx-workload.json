@@ -1,0 +1,10 @@
+{
+  "metadata": { "name": "audio-model", "labels": { "app": "audio-model" } },
+  "spec": {
+    "workload": { "type": "NativeProcess", "object": { "profile": "audio-model" } },
+    "nodeName": "mini2",
+    "resources": { "cpu": 4, "memoryBytes": 8589934592 },
+    "restartPolicy": "OnFailure",
+    "desiredState": "Running"
+  }
+}

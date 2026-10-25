@@ -1,0 +1,19 @@
+{
+  "type": "NativeProcess",
+  "config": {
+    "stateDirectory": "/absolute/approved/velos-native-state",
+    "profiles": {
+      "audio-model": {
+        "executable": "/absolute/approved/model-release/.venv/bin/python",
+        "args": ["-m", "model_service.server", "--provider", "mlx-qwen3-1.7b"],
+        "workingDirectory": "/absolute/approved/model-release",
+        "env": {
+          "HF_HUB_OFFLINE": "1",
+          "HF_HOME": "/absolute/approved/model-data/huggingface",
+          "PYTHONUNBUFFERED": "1"
+        },
+        "stopTimeoutSeconds": 30
+      }
+    }
+  }
+}

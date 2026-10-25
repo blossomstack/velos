@@ -155,8 +155,49 @@ fn normalize_desired_state(kind: &str, doc: &mut Value) -> Result<(), ApiError> 
     }
 }
 
-/// Admission (fail closed): reject malformed placement in a Container/Worker
-/// spec, rather than letting the scheduler silently skip the bad expression.
+/// Native launches select a provisioned local profile on an explicit worker.
+fn validate_workload(kind: &str, doc: &Value) -> Result<(), ApiError> {
+    if kind != "Container" {
+        return Ok(());
+    }
+    let Some(workload) = doc.pointer("/spec/workload").filter(|v| !v.is_null()) else {
+        return Ok(());
+    };
+    if workload
+        .as_object()
+        .is_none_or(|o| o.keys().any(|k| k != "type" && k != "object"))
+        || workload
+            .get("object")
+            .and_then(Value::as_object)
+            .is_none_or(|o| o.keys().any(|k| k != "profile"))
+    {
+        return Err(ApiError::BadRequest(
+            "native workload accepts only type and object.profile".into(),
+        ));
+    }
+    let native: velos_runtime::native::NativeWorkload = serde_json::from_value(workload.clone())
+        .map_err(|e| ApiError::BadRequest(format!("invalid spec.workload: {e}")))?;
+    let velos_runtime::native::NativeWorkload::NativeProcess(reference) = native;
+    if !velos_runtime::native::valid_name(&reference.profile) {
+        return Err(ApiError::BadRequest("invalid native profile name".into()));
+    }
+    if str_at(doc, &["spec", "nodeName"]).is_none_or(str::is_empty) {
+        return Err(ApiError::BadRequest(
+            "native workloads require explicit spec.nodeName for provisioned local profiles".into(),
+        ));
+    }
+    for field in ["image", "command", "env"] {
+        if doc.get("spec").and_then(|s| s.get(field)).is_some_and(|v| {
+            !v.is_null() && v != "" && v != &serde_json::json!([]) && v != &serde_json::json!({})
+        }) {
+            return Err(ApiError::BadRequest(format!(
+                "native workload cannot set spec.{field}; use its local profile"
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn validate_placement(kind: &str, doc: &Value) -> Result<(), ApiError> {
     let Some(spec) = doc.get("spec") else {
         return Ok(());
@@ -541,6 +582,7 @@ async fn create(
     }
     let name =
         extract_name(&body).ok_or_else(|| ApiError::BadRequest("metadata.name required".into()))?;
+    validate_workload(kind, &body)?;
     validate_placement(kind, &body)?;
     validate_service(kind, &body)?;
     normalize_desired_state(kind, &mut body)?;
@@ -675,6 +717,7 @@ async fn replace(
     if !body.is_object() {
         return Err(ApiError::BadRequest("body must be a JSON object".into()));
     }
+    validate_workload(kind, &body)?;
     validate_placement(kind, &body)?;
     validate_service(kind, &body)?;
     normalize_desired_state(kind, &mut body)?;
@@ -686,6 +729,18 @@ async fn replace(
 
     let alloc = lock_port_alloc(&state, kind)?;
     let existing = state.store.get(kind, &name)?.ok_or(ApiError::NotFound)?;
+    if kind == "Container"
+        && existing
+            .document
+            .pointer("/spec/workload")
+            .filter(|v| !v.is_null())
+            != body.pointer("/spec/workload").filter(|v| !v.is_null())
+    {
+        return Err(ApiError::BadRequest(
+            "workload runtime/profile is immutable; create a new workload".into(),
+        ));
+    }
+
     if kind == KIND_SERVICE {
         allocate_node_ports(state.store.as_ref(), &name, &mut body)?;
     }
@@ -1418,6 +1473,36 @@ mod tests {
             "metadata": { "name": "web" },
             "spec": { "selector": { "app": "web" }, "ports": ports },
         })
+    }
+
+    #[test]
+    fn native_admission_requires_profile_placement_and_rejects_remote_commands() {
+        let valid = serde_json::json!({"spec":{"nodeName":"mini2","workload":{"type":"NativeProcess","object":{"profile":"qwen"}}}});
+        assert!(validate_workload("Container", &valid).is_ok());
+        for value in [
+            serde_json::json!({"type":"Shell","object":{"profile":"qwen"}}),
+            serde_json::json!({"type":"NativeProcess","object":{"profile":"../escape"}}),
+            serde_json::json!({"type":"NativeProcess","object":{"profile":"qwen","args":["bad"]}}),
+        ] {
+            let mut invalid = valid.clone();
+            invalid["spec"]["workload"] = value;
+            assert!(validate_workload("Container", &invalid).is_err());
+        }
+        let mut unplaced = valid.clone();
+        unplaced["spec"]["nodeName"] = Value::Null;
+        assert!(validate_workload("Container", &unplaced).is_err());
+        for (field, value) in [
+            ("image", serde_json::json!("alpine")),
+            ("command", serde_json::json!(["/bin/sh"])),
+            ("env", serde_json::json!({"PATH":"/tmp"})),
+        ] {
+            let mut invalid = valid.clone();
+            invalid["spec"][field] = value;
+            assert!(validate_workload("Container", &invalid).is_err());
+        }
+        assert!(
+            validate_workload("Container", &serde_json::json!({"spec":{"image":"alpine"}})).is_ok()
+        );
     }
 
     #[test]

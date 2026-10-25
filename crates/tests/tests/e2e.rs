@@ -396,7 +396,7 @@ async fn a_service_forwards_a_node_port_to_its_container_and_publishes_the_endpo
     assert!((30000..=32767).contains(&node_port));
 
     // The worker opens the port and forwards to the running container.
-    let proxy = NodeProxy::new();
+    let proxy = NodeProxy::with_bind_ip(std::net::Ipv4Addr::LOCALHOST);
     assert_eq!(
         sync_services(&client, &runtime, "w1", &proxy)
             .await
@@ -794,6 +794,7 @@ async fn a_joined_worker_restarts_after_its_join_token_is_gone() {
     let boot_tok = joined(&mint);
 
     let cfg = WorkerConfig {
+        runtime: Default::default(),
         server: base.clone(),
         node: "w1".to_string(),
         credential: None,
