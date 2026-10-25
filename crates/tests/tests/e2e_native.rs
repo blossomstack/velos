@@ -77,6 +77,7 @@ fn native_fixture() {
     println!("cwd={}", std::env::current_dir().unwrap().display());
     println!("parent_path_present={}", std::env::var_os("PATH").is_some());
     eprintln!("fixture stderr");
+    std::fs::write("instance", std::env::var("VELOS_INSTANCE_ID").unwrap()).unwrap();
     std::fs::write("ready", std::process::id().to_string()).unwrap();
     match mode.as_str() {
         "exit" => std::process::exit(7),
@@ -98,6 +99,16 @@ fn native_fixture() {
                 libc::signal(libc::SIGTERM, libc::SIG_IGN);
             }
             std::fs::write("ignoring", "yes").unwrap();
+        }
+        "pipe-holder" => {
+            use std::os::unix::process::CommandExt;
+            let child = std::process::Command::new("/bin/sleep")
+                .arg("3")
+                .process_group(0)
+                .spawn()
+                .unwrap();
+            std::mem::forget(child);
+            std::process::exit(0);
         }
         "sleep" => {}
         _ => panic!("unknown fixture mode"),
@@ -150,7 +161,11 @@ async fn native_lifecycle_is_owned_idempotent_and_does_not_stop_unrelated_proces
         InstanceState::Exited { .. }
     ));
     assert!(unrelated.try_wait().unwrap().is_none());
-    rt.start("one").await.unwrap();
+    let resumed_id = rt.start("one").await.unwrap();
+    assert_ne!(
+        id, resumed_id,
+        "a fresh process has a fresh launch identity"
+    );
     assert_eq!(rt.list().await.unwrap()[0].state, InstanceState::Running);
     rt.remove("one").await.unwrap();
     assert!(rt.list().await.unwrap().is_empty());
@@ -202,8 +217,11 @@ async fn termination_timeout_escalates_and_drop_cleans_owned_children() {
     assert_eq!(wait_exit(&rt).await, 128 + libc::SIGKILL);
     rt.start("one").await.unwrap();
     drop(rt);
-    assert!(!dir.0.join("state/fixture.active").exists());
-    NativeProcess::new(dir.config("sleep")).unwrap();
+    assert!(
+        dir.0.join("state/fixture.active").exists(),
+        "unclean Drop retains the recovery record"
+    );
+    assert!(NativeProcess::new(dir.config("sleep")).is_err());
 }
 
 #[tokio::test]
@@ -351,16 +369,28 @@ async fn readiness_requires_explicit_ready_and_the_owned_pid() {
     let directory = Directory::new();
     let pid = Arc::new(AtomicU64::new(0));
     let ready = Arc::new(AtomicBool::new(false));
+    let large = Arc::new(AtomicBool::new(false));
+    let route_large = large.clone();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
+    let instance = Arc::new(std::sync::Mutex::new(String::new()));
+    let route_instance = instance.clone();
     let route_pid = pid.clone();
     let route_ready = ready.clone();
     let app = axum::Router::new().route(
         "/ready",
         axum::routing::get(move || {
             let pid = route_pid.load(Ordering::SeqCst);
+            let instance = route_instance.lock().unwrap().clone();
             let ready = route_ready.load(Ordering::SeqCst);
-            async move { axum::Json(serde_json::json!({"pid":pid,"ready":ready})) }
+            let large = route_large.load(Ordering::SeqCst);
+            async move {
+                let mut body = serde_json::json!({"pid":pid,"instance":instance,"ready":ready});
+                if large {
+                    body["padding"] = serde_json::json!("x".repeat(9000));
+                }
+                axum::Json(body)
+            }
         }),
     );
     let server = tokio::spawn(async move {
@@ -389,7 +419,20 @@ async fn readiness_requires_explicit_ready_and_the_owned_pid() {
             .unwrap(),
         Ordering::SeqCst,
     );
+    assert_eq!(
+        runtime.health().await.unwrap()[0].ready,
+        Some(false),
+        "matching PID with wrong launch ID is not ready"
+    );
+    *instance.lock().unwrap() = std::fs::read_to_string(directory.0.join("instance")).unwrap();
     assert_eq!(runtime.health().await.unwrap()[0].ready, Some(true));
+    large.store(true, Ordering::SeqCst);
+    assert_eq!(
+        runtime.health().await.unwrap()[0].ready,
+        Some(false),
+        "oversized response must not qualify"
+    );
+    large.store(false, Ordering::SeqCst);
     ready.store(false, Ordering::SeqCst);
     assert_eq!(runtime.health().await.unwrap()[0].ready, Some(false));
     runtime.shutdown().await.unwrap();
@@ -425,4 +468,233 @@ async fn executable_arguments_are_literal_not_shell_code() {
         "$(touch injected); `whoami`\n"
     );
     assert!(!dir.0.join("injected").exists());
+}
+
+#[tokio::test]
+async fn inherited_output_pipe_is_bounded_and_cancelled_cleanup_stays_fail_closed() {
+    let dir = Directory::new();
+    let runtime = NativeProcess::new(dir.config("pipe-holder")).unwrap();
+    runtime.run(&spec("one")).await.unwrap();
+    wait_file(dir.0.join("ready")).await;
+    // Allow the foreground fixture to exit while its short-lived, deliberately
+    // detached sleep child still holds the inherited pipes. Never kill/adopt it.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), runtime.list())
+            .await
+            .is_err()
+    );
+    let result = tokio::time::timeout(Duration::from_secs(2), runtime.list())
+        .await
+        .unwrap();
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("ownership record retained")
+    );
+    assert!(runtime.start("one").await.is_err());
+    assert!(runtime.remove("one").await.is_err());
+    assert!(dir.0.join("state/fixture.active").exists());
+    drop(runtime);
+    assert!(NativeProcess::new(dir.config("sleep")).is_err());
+}
+
+#[tokio::test]
+#[ignore = "crash fixture owner; launched explicitly by integration test"]
+async fn crash_owner_fixture() {
+    let root = PathBuf::from(std::env::var("OWNER_ROOT").unwrap());
+    let directory = std::mem::ManuallyDrop::new(Directory(root));
+    let mut config = directory.config("sleep");
+    let profile = config.profiles.get_mut("fixture").unwrap();
+    profile.executable = "/bin/sleep".into();
+    profile.args = vec!["0.2".into()];
+    let runtime = NativeProcess::new(config).unwrap();
+    runtime.run(&spec("orphan")).await.unwrap();
+    std::process::exit(0); // deliberately skip runtime Drop, like worker death
+}
+
+#[tokio::test]
+async fn fresh_worker_refuses_actual_unclean_owner_record_even_after_child_exits() {
+    let directory = Directory::new();
+    let output = tokio::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--ignored", "--exact", "crash_owner_fixture", "--nocapture"])
+        .env_clear()
+        .env("OWNER_ROOT", &directory.0)
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(directory.0.join("state/fixture.active").exists());
+    assert!(NativeProcess::new(directory.config("sleep")).is_err());
+}
+
+#[tokio::test]
+async fn readiness_timeout_and_restart_in_flight_never_report_stale_success() {
+    use tokio::sync::Notify;
+    let directory = Directory::new();
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let response_pid = Arc::new(AtomicU64::new(0));
+    let response_instance = Arc::new(std::sync::Mutex::new(String::new()));
+    let route_instance = response_instance.clone();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let route_entered = entered.clone();
+    let route_release = release.clone();
+    let route_pid = response_pid.clone();
+    let app = axum::Router::new().route(
+        "/ready",
+        axum::routing::get(move || {
+            let entered = route_entered.clone();
+            let release = route_release.clone();
+            let pid = route_pid.load(Ordering::SeqCst);
+            let instance = route_instance.lock().unwrap().clone();
+            async move {
+                entered.notify_one();
+                release.notified().await;
+                axum::Json(serde_json::json!({"pid":pid,"instance":instance,"ready":true}))
+            }
+        }),
+    );
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let mut config = directory.config("sleep");
+    config.profiles.get_mut("fixture").unwrap().readiness =
+        Some(velos_runtime::native::ReadinessProbe {
+            port,
+            path: "/ready".into(),
+        });
+    let runtime = Arc::new(NativeProcess::new(config).unwrap());
+    runtime.run(&spec("one")).await.unwrap();
+    wait_file(directory.0.join("ready")).await;
+    response_pid.store(
+        std::fs::read_to_string(directory.0.join("ready"))
+            .unwrap()
+            .parse()
+            .unwrap(),
+        Ordering::SeqCst,
+    );
+    *response_instance.lock().unwrap() =
+        std::fs::read_to_string(directory.0.join("instance")).unwrap();
+    // Server never replies: the entire request/body must be bounded.
+    let health = tokio::time::timeout(Duration::from_secs(2), runtime.health())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(health[0].ready, Some(false));
+    // Consume the notification from the timed-out probe before the next probe.
+    entered.notified().await;
+    let probing_runtime = runtime.clone();
+    let probing = tokio::spawn(async move { probing_runtime.health().await.unwrap() });
+    tokio::time::timeout(Duration::from_secs(2), entered.notified())
+        .await
+        .unwrap();
+    runtime.stop("one").await.unwrap();
+    runtime.start("one").await.unwrap();
+    release.notify_waiters();
+    assert_eq!(
+        probing.await.unwrap()[0].ready,
+        Some(false),
+        "old response cannot bless a new launch"
+    );
+    assert_eq!(
+        runtime.list().await.unwrap()[0].state,
+        InstanceState::Running
+    );
+    runtime.shutdown().await.unwrap();
+    server.abort();
+}
+
+#[tokio::test]
+async fn concurrent_mixed_launches_cannot_claim_the_same_uid() {
+    let dir = Directory::new();
+    let runtime = MixedRuntime::new(
+        Arc::new(FakeRuntime::new()),
+        NativeProcess::new(dir.config("sleep")).unwrap(),
+    );
+    let native = spec("same");
+    let container = RunSpec {
+        uid: "same".into(),
+        workload: Workload::Container {
+            image: "fixture".into(),
+        },
+        command: vec![],
+        env: vec![],
+    };
+    let (first, second) = tokio::join!(runtime.run(&native), runtime.run(&container));
+    assert_ne!(first.is_ok(), second.is_ok());
+    assert_eq!(runtime.list().await.unwrap().len(), 1);
+    runtime.remove("same").await.unwrap();
+}
+
+#[test]
+fn local_profile_validation_and_diagnostic_redaction() {
+    let directory = Directory::new();
+    let valid = directory.config("sleep");
+    for path in [
+        "http://remote/",
+        "//remote/",
+        "/\\remote",
+        "/ready\r\nHost: remote",
+        "/ready\0",
+        "/ready#fragment",
+    ] {
+        let mut config = valid.clone();
+        config.profiles.get_mut("fixture").unwrap().readiness =
+            Some(velos_runtime::native::ReadinessProbe {
+                port: 8766,
+                path: path.into(),
+            });
+        assert!(config.validate().is_err(), "{path:?}");
+    }
+    let mut relative = valid.clone();
+    relative.profiles.get_mut("fixture").unwrap().executable = "python".into();
+    assert!(relative.validate().is_err());
+    let mut invalid_env = valid.clone();
+    invalid_env
+        .profiles
+        .get_mut("fixture")
+        .unwrap()
+        .env
+        .insert("INVALID=KEY".into(), "value".into());
+    assert!(invalid_env.validate().is_err());
+    let mut config = valid;
+    config
+        .profiles
+        .get_mut("fixture")
+        .unwrap()
+        .env
+        .insert("EXAMPLE_SECRET".into(), "not-a-real-secret".into());
+    let worker: veloslet::daemon::WorkerConfig = serde_json::from_value(serde_json::json!({
+        "server":"http://127.0.0.1:1", "node":"fixture", "cpu":1, "memory":"1G", "runtime": {"type":"NativeProcess", "config":config}
+    })).unwrap();
+    let diagnostic = veloslet::config::redacted_json(&worker).unwrap();
+    assert!(diagnostic.contains("EXAMPLE_SECRET"));
+    assert!(!diagnostic.contains("not-a-real-secret"));
+}
+
+#[tokio::test]
+async fn log_paths_and_state_directory_do_not_follow_symlinks() {
+    use std::os::unix::fs::symlink;
+    let directory = Directory::new();
+    let config = directory.config("sleep");
+    let runtime = NativeProcess::new(config.clone()).unwrap();
+    let sentinel = directory.0.join("sentinel");
+    std::fs::write(&sentinel, "unchanged").unwrap();
+    symlink(&sentinel, directory.0.join("state/one.stdout.log")).unwrap();
+    assert!(runtime.run(&spec("one")).await.is_err());
+    assert_eq!(std::fs::read_to_string(sentinel).unwrap(), "unchanged");
+    assert!(!directory.0.join("state/fixture.active").exists());
+    drop(runtime);
+    symlink(directory.0.join("state"), directory.0.join("alias")).unwrap();
+    let mut alias = config;
+    alias.state_directory = directory.0.join("alias");
+    assert!(NativeProcess::new(alias).is_err());
 }

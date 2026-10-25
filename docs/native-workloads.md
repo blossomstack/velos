@@ -23,8 +23,9 @@ Velos creates the final directory privately (0700). Use one stable state directo
 per worker, never a new directory to evade an ownership/recovery error.
 
 Profiles are local allowlisted commands, not shell strings. The child receives
-only the configured environment (no inherited PATH, credentials or shell startup
-files), null stdin, explicit argv, and its release working directory. Configure
+only the configured environment plus a fresh supervisor-owned `VELOS_INSTANCE_ID`
+UUID (no inherited PATH, credentials or shell startup files), null stdin, explicit
+argv, and its release working directory. Profiles cannot override this launch ID. Configure
 any required HOME/PATH explicitly. Use absolute executables and foreground servers;
 launchers that daemonize, detach sessions or escape the process group are unsupported.
 A native workload runs with the worker user's filesystem and device permissions;
@@ -59,9 +60,11 @@ An optional local profile field enables a bounded loopback probe:
 "readiness": { "port": 8766, "path": "/ready" }
 ```
 
-The endpoint must return HTTP success and JSON `{"pid":1234,"ready":true}`, where
-`pid` is the actual owned foreground child. A different process's listener cannot
-claim readiness. Redirects/proxies are disabled; each request has a one-second
+The endpoint must return HTTP success and JSON
+`{"pid":1234,"instance":"<VELOS_INSTANCE_ID>","ready":true}`. Both the owned
+foreground child PID and its unique launch ID must match. A stale listener or reused
+PID cannot claim readiness for a new launch. Liveness and launch identity are
+rechecked after each response, including across a concurrent restart. Redirects/proxies are disabled; each request has a one-second
 budget and an 8 KiB response cap. Model warm-up and cold-load completion belong to
 the model server. The audio POC's liveness-only `/health` is **not** this contract;
 the example intentionally leaves readiness unknown until an application readiness
@@ -80,7 +83,11 @@ Logs are private `<uid>.stdout.log` / `<uid>.stderr.log` files in the state dire
 Each retains the first MiB per launch; further bytes are drained, with truncation
 and discarded counts reported through worker tracing. Resume/restart replaces that
 UID's logs. Delete retains logs for diagnosis; operators manage retention across
-completed UIDs. No remote logs endpoint is added in this implementation.
+completed UIDs. Disk write errors are reported while output continues to drain.
+Log readers are cancellable; after exit each pipe gets at most one second to reach
+EOF. A pipe held open by an escaped descendant fails cleanup and retains the
+ownership record rather than hanging reconciliation or silently allowing relaunch.
+No remote logs endpoint is added in this implementation.
 
 ## Ownership and recovery
 
@@ -88,7 +95,11 @@ Every child is a new process group; signalling is restricted to a live, owned,
 unreaped child/group. Exit observation uses `waitid(WNOWAIT)` so the group leader's
 PID cannot be reused before group cleanup. No persisted PID, port, command-name
 match, `killall` or process search is used to stop anything. Ordinary worker shutdown
-stops native children and preserves existing container lifecycle behavior.
+stops native children and preserves existing container lifecycle behavior. Each
+launch has a distinct runtime instance ID. An unclean runtime Drop attempts to kill
+its owned group and reaps asynchronously; it retains the recovery record because
+only orderly cleanup can verify output-pipe closure. Cancellation during cleanup
+keeps handles attached so a subsequent stop can complete or fail closed.
 
 An exclusive state-directory file lock prevents concurrent owners. Before spawn,
 a durable `<profile>.active` intent record is written. An unclean worker exit may
@@ -110,8 +121,8 @@ MLX, model weights or GPUs. It covers ownership, lifecycle, bounded logs, explic
 environment, exit status, backoff/admission, mixed dispatch, API reconciliation and
 readiness identity. Run `cargo test -p velos-tests --test e2e_native` on an execution
 host allowed to signal its own process groups and bind ephemeral loopback listeners.
-On Mac mini 2 the native suite passes (10 tests plus one intentionally ignored
-fixture entrypoint, invoked by the tests). No model services were started or changed.
+On Mac mini 2 the native suite passes (16 tests plus two intentionally ignored
+fixture entrypoints, invoked by the tests). No model services were started or changed.
 Darwin returns EPERM for zombie-only groups; cleanup verifies WNOWAIT exit and a
 leader-only/empty group before accepting that case, preserving real permission errors.
 This behavior is described by Apple's [killpg1 implementation](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/kern/kern_sig.c).
@@ -120,3 +131,6 @@ Real MLX/Metal execution, application drain behavior and a model-ready endpoint
 remain application integration checks. They require a separately approved rollout;
 the current audio POC is untouched. The examples contain placeholder provisioning
 paths and are not deployment commands.
+
+See [verification results](native-validation.md) for the full default-parallel gate,
+proxy regression coverage, safety review and the explicit real-container test exclusion.

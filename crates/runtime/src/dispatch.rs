@@ -36,15 +36,21 @@ impl RuntimeConfig {
 pub struct MixedRuntime {
     container: Arc<dyn ContainerRuntime>,
     native: NativeProcess,
+    mutations: tokio::sync::Mutex<()>,
 }
 impl MixedRuntime {
     pub fn new(container: Arc<dyn ContainerRuntime>, native: NativeProcess) -> Self {
-        Self { container, native }
+        Self {
+            container,
+            native,
+            mutations: tokio::sync::Mutex::new(()),
+        }
     }
 }
 #[async_trait]
 impl ContainerRuntime for MixedRuntime {
     async fn run(&self, spec: &RunSpec) -> Result<InstanceId, RuntimeError> {
+        let _guard = self.mutations.lock().await;
         match &spec.workload {
             Workload::Container { .. } => {
                 if self.native.contains(&spec.uid).await {
@@ -71,6 +77,7 @@ impl ContainerRuntime for MixedRuntime {
         }
     }
     async fn stop(&self, uid: &str) -> Result<(), RuntimeError> {
+        let _guard = self.mutations.lock().await;
         if self.native.contains(uid).await {
             self.native.stop(uid).await
         } else {
@@ -78,6 +85,7 @@ impl ContainerRuntime for MixedRuntime {
         }
     }
     async fn start(&self, uid: &str) -> Result<InstanceId, RuntimeError> {
+        let _guard = self.mutations.lock().await;
         if self.native.contains(uid).await {
             self.native.start(uid).await
         } else {
@@ -85,6 +93,7 @@ impl ContainerRuntime for MixedRuntime {
         }
     }
     async fn remove(&self, uid: &str) -> Result<(), RuntimeError> {
+        let _guard = self.mutations.lock().await;
         if self.native.contains(uid).await {
             self.native.remove(uid).await
         } else {
@@ -107,6 +116,7 @@ impl ContainerRuntime for MixedRuntime {
         self.native.health().await
     }
     async fn shutdown(&self) -> Result<(), RuntimeError> {
+        let _guard = self.mutations.lock().await;
         self.native.shutdown().await
     }
     async fn version(&self) -> Result<String, RuntimeError> {

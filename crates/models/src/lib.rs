@@ -42,7 +42,7 @@ impl Container {
             ObjectMeta::new_named(name),
             ContainerSpec::new(
                 None, // workload: legacy container
-                image.into(),
+                Some(image.into()),
                 Vec::new(),
                 HashMap::new(),
                 ResourceReqs::new(1, 512 * 1024 * 1024),
@@ -101,6 +101,19 @@ mod tests {
         // round-trip below proves the field exists and deserializes.
         let back: Container = serde_json::from_str(&json).unwrap();
         assert_eq!(c, back);
+    }
+
+    #[test]
+    fn native_wire_spec_omits_container_image() {
+        let mut c = Container::pending("model", "unused");
+        c.spec.image = None;
+        c.spec.workload = Some(NativeWorkload::NativeProcess(NativeProcessRef::new(
+            "model".into(),
+        )));
+        let json = serde_json::to_value(&c).unwrap();
+        assert!(json["spec"].get("image").is_none());
+        assert_eq!(json["spec"]["workload"]["object"]["profile"], "model");
+        assert_eq!(serde_json::from_value::<Container>(json).unwrap(), c);
     }
 
     #[test]

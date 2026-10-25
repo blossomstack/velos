@@ -92,7 +92,7 @@ union NativeWorkload {
 
 struct ContainerSpec {
     workload: Option<NativeWorkload>,
-    image: String,
+    image: Option<String>,
     command: Vec<String>,
     env: Map<String, String>,
     resources: ResourceReqs,

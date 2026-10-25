@@ -2,7 +2,8 @@
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
@@ -10,6 +11,7 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use tokio::io::{AsyncWriteExt, unix::AsyncFd};
 use tokio::sync::Mutex;
 
 use crate::{
@@ -19,7 +21,8 @@ use crate::{
 
 pub use velos_models::velos::{NativeProcessRef, NativeWorkload};
 
-/// Loopback HTTP JSON contract: {"pid": <owned child pid>, "ready": true}.
+/// Loopback HTTP JSON contract: owned pid, VELOS_INSTANCE_ID as instance,
+/// and ready: true. A fresh launch ID prevents stale PID reuse from qualifying.
 /// No redirects, remote URLs or liveness-only responses qualify as readiness.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -72,7 +75,12 @@ impl NativeConfig {
         }
         for (name, profile) in &self.profiles {
             if profile.readiness.as_ref().is_some_and(|p| {
-                p.port == 0 || !p.path.starts_with('/') || p.path.contains(['\r', '\n', '#'])
+                p.port == 0
+                    || !p.path.starts_with('/')
+                    || p.path.starts_with("//")
+                    || p.path.len() > 2048
+                    || p.path.contains(['\\', '#'])
+                    || p.path.bytes().any(|b| b.is_ascii_control())
             }) {
                 return Err(failure(format!(
                     "invalid native readiness probe for {name}"
@@ -83,10 +91,12 @@ impl NativeConfig {
                 || !profile.working_directory.is_absolute()
                 || !(1..=60).contains(&profile.stop_timeout_seconds)
                 || profile.args.iter().any(|a| a.contains('\0'))
-                || profile
-                    .env
-                    .iter()
-                    .any(|(k, v)| k.is_empty() || k.contains(['=', '\0']) || v.contains('\0'))
+                || profile.env.iter().any(|(k, v)| {
+                    k == "VELOS_INSTANCE_ID"
+                        || k.is_empty()
+                        || k.contains(['=', '\0'])
+                        || v.contains('\0')
+                })
             {
                 return Err(failure(format!("invalid native profile {name}")));
             }
@@ -96,21 +106,29 @@ impl NativeConfig {
 }
 
 struct OwnedProcess {
-    child: Child,
+    child: Option<Child>,
+    pid: u32,
+    launch_id: uuid::Uuid,
+    cleanup_error: Option<String>,
+    cleanup_done: bool,
     profile: String,
     marker: PathBuf,
     exit: Option<i32>,
-    drains: Vec<std::thread::JoinHandle<()>>,
+    drains: Vec<tokio::task::JoinHandle<()>>,
 }
 
 impl OwnedProcess {
+    fn instance_id(&self, uid: &str) -> InstanceId {
+        InstanceId(format!("native-{uid}-{}", self.launch_id))
+    }
+
     // SAFETY: child is our unreaped child and group leader; no other code waits
     // for it. Its PID/PGID cannot be reused until we reap it below. Never signal
     // after exit has been cached. No PID from disk ever reaches this method.
     fn signal(&self, signal: i32) -> Result<(), RuntimeError> {
         if self.exit.is_none() {
-            let pgid = unsafe { libc::getpgid(self.child.id() as i32) };
-            if pgid >= 0 && pgid != self.child.id() as i32 {
+            let pgid = unsafe { libc::getpgid(self.pid as i32) };
+            if pgid >= 0 && pgid != self.pid as i32 {
                 return Err(failure(
                     "native child escaped its owned process group; operator recovery required",
                 ));
@@ -119,7 +137,7 @@ impl OwnedProcess {
                 return Err(io(std::io::Error::last_os_error()));
             }
         }
-        if self.exit.is_none() && unsafe { libc::kill(-(self.child.id() as i32), signal) } != 0 {
+        if self.exit.is_none() && unsafe { libc::kill(-(self.pid as i32), signal) } != 0 {
             let error = std::io::Error::last_os_error();
             // Darwin's killpg1 skips zombies and returns EPERM when it finds
             // no signalable members. Do not swallow a real permission error:
@@ -148,13 +166,13 @@ impl OwnedProcess {
             *libc::__error() = 0;
             libc::proc_listpids(
                 2, /* PROC_PGRP_ONLY */
-                self.child.id(),
+                self.pid,
                 pids.as_mut_ptr().cast(),
                 std::mem::size_of_val(&pids) as i32,
             )
         };
         let error = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
-        error == 0 && (bytes == 0 || (bytes == 4 && pids[0] == self.child.id() as i32))
+        error == 0 && (bytes == 0 || (bytes == 4 && pids[0] == self.pid as i32))
     }
 
     fn exited_without_reaping(&self) -> Result<bool, RuntimeError> {
@@ -168,7 +186,7 @@ impl OwnedProcess {
         let result = unsafe {
             libc::waitid(
                 libc::P_PID,
-                self.child.id(),
+                self.pid,
                 &mut info,
                 libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
             )
@@ -186,21 +204,54 @@ impl OwnedProcess {
         Ok(pid != 0)
     }
 
-    fn observe(&mut self) -> Result<InstanceState, RuntimeError> {
+    async fn observe(&mut self) -> Result<InstanceState, RuntimeError> {
+        if let Some(error) = &self.cleanup_error {
+            return Err(failure(error.clone()));
+        }
         if self.exit.is_none() && self.exited_without_reaping()? {
             self.signal(libc::SIGKILL)?;
-            let status = self.child.wait().map_err(io)?;
+            let status = self
+                .child
+                .as_mut()
+                .ok_or_else(|| failure("owned child handle missing"))?
+                .wait()
+                .map_err(io)?;
             self.exit = Some(
                 status
                     .code()
                     .unwrap_or_else(|| 128 + status.signal().unwrap_or(0)),
             );
-            std::fs::remove_file(&self.marker).map_err(io)?;
-            for drain in self.drains.drain(..) {
-                if drain.join().is_err() {
-                    tracing::warn!("native log drain panicked");
+        }
+        if self.exit.is_some() && !self.cleanup_done {
+            // An escaped descendant can keep inherited pipes open. Never let
+            // it hold reconciliation forever, or relaunch while cleanup is
+            // ambiguous. Cancellation releases the read ends; retain the marker.
+            while let Some(drain) = self.drains.last_mut() {
+                // Keep handles in self across await so cancellation cannot
+                // detach readers or mark cleanup complete prematurely.
+                let problem = match tokio::time::timeout(Duration::from_secs(1), drain).await {
+                    Ok(Ok(())) => None,
+                    Ok(Err(error)) => Some(format!("native log task failed: {error}")),
+                    Err(_) => Some("native output pipe did not close within one second".into()),
+                };
+                if let Some(problem) = problem {
+                    for drain in &self.drains {
+                        drain.abort();
+                    }
+                    let message =
+                        format!("{problem}; ownership record retained; operator recovery required");
+                    tracing::error!(%message);
+                    self.cleanup_error = Some(message.clone());
+                    return Err(failure(message));
                 }
+                self.drains.pop();
             }
+            if let Err(error) = std::fs::remove_file(&self.marker) {
+                let message = format!("removing native ownership record failed: {error}");
+                self.cleanup_error = Some(message.clone());
+                return Err(failure(message));
+            }
+            self.cleanup_done = true;
         }
         Ok(match self.exit {
             Some(exit_code) => InstanceState::Exited { exit_code },
@@ -211,43 +262,83 @@ impl OwnedProcess {
 
 impl Drop for OwnedProcess {
     fn drop(&mut self) {
+        for drain in &self.drains {
+            drain.abort();
+        }
         if self.exit.is_none() {
             if let Err(error) = self.signal(libc::SIGKILL) {
                 tracing::error!(%error, "native cleanup failed; ownership marker retained");
-                return;
             }
-            if self.child.wait().is_ok() {
-                let _ = std::fs::remove_file(&self.marker);
+            tracing::warn!(
+                pid = self.pid,
+                "native runtime dropped without orderly cleanup; ownership record retained"
+            );
+            if let Some(mut child) = self.child.take() {
+                // Destruction must not block an async executor on wait(2). This
+                // thread only reaps the already-owned handle; it never signals
+                // a numeric PID. Drop cannot verify pipe EOF, so only orderly
+                // cleanup may remove the ownership record.
+                let result = std::thread::Builder::new()
+                    .name("velos-native-reap".into())
+                    .spawn(move || {
+                        if let Err(error) = child.wait() {
+                            tracing::error!(%error, "native child reap failed");
+                        }
+                    });
+                if let Err(error) = result {
+                    tracing::error!(%error, "native reaper unavailable; ownership marker retained");
+                }
             }
         }
     }
 }
 
-/// Logs retain the first MiB per stream per launch, then continue draining.
-/// Report truncation with counts; never block a server on a full output pipe.
-fn drain(mut source: impl Read + Send + 'static, mut file: File) -> std::thread::JoinHandle<()> {
-    std::thread::spawn(move || {
+/// First MiB per stream per launch; excess output is counted and drained.
+/// Async, cancellable pipe reads prevent inherited descriptors from hanging
+/// shutdown. A disk write failure also keeps draining rather than causing SIGPIPE.
+fn drain<R: Read + AsRawFd + Send + 'static>(
+    source: R,
+    file: File,
+) -> Result<tokio::task::JoinHandle<()>, RuntimeError> {
+    let fd = source.as_raw_fd();
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return Err(io(std::io::Error::last_os_error()));
+    }
+    let mut source = AsyncFd::new(source).map_err(io)?;
+    let mut file = tokio::fs::File::from_std(file);
+    Ok(tokio::spawn(async move {
         const LIMIT: usize = 1024 * 1024;
         let mut written = 0;
         let mut dropped = 0u64;
+        let mut writable = true;
         let mut buffer = [0; 8192];
         loop {
-            match source.read(&mut buffer) {
+            let read = match source.readable_mut().await {
+                Ok(mut ready) => match ready.try_io(|inner| inner.get_mut().read(&mut buffer)) {
+                    Ok(result) => result,
+                    Err(_) => continue,
+                },
+                Err(error) => Err(error),
+            };
+            match read {
                 Ok(0) => break,
                 Ok(n) => {
-                    let keep = n.min(LIMIT - written);
-                    if let Err(error) = file.write_all(&buffer[..keep]) {
-                        tracing::error!(%error, "native log write failed");
-                        break;
+                    let keep = if writable { n.min(LIMIT - written) } else { 0 };
+                    if let Err(error) = file.write_all(&buffer[..keep]).await {
+                        tracing::error!(%error, "native log write failed; continuing to drain");
+                        writable = false;
+                        dropped += n as u64;
+                    } else {
+                        written += keep;
+                        if n > keep && dropped == 0 {
+                            tracing::warn!(
+                                limit = LIMIT,
+                                "native log truncated; draining remaining output"
+                            );
+                        }
+                        dropped += (n - keep) as u64;
                     }
-                    written += keep;
-                    if n > keep && dropped == 0 {
-                        tracing::warn!(
-                            limit = LIMIT,
-                            "native log truncated; draining remaining output"
-                        );
-                    }
-                    dropped += (n - keep) as u64;
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(error) => {
@@ -256,10 +347,13 @@ fn drain(mut source: impl Read + Send + 'static, mut file: File) -> std::thread:
                 }
             }
         }
+        if let Err(error) = file.flush().await {
+            tracing::error!(%error, "native log flush failed");
+        }
         if dropped > 0 {
             tracing::warn!(dropped_bytes = dropped, "native log truncation complete");
         }
-    })
+    }))
 }
 
 pub struct NativeProcess {
@@ -281,9 +375,12 @@ impl NativeProcess {
             Err(e) => return Err(io(e)),
         }
         let metadata = std::fs::symlink_metadata(root).map_err(io)?;
-        if !metadata.is_dir() || metadata.permissions().mode() & 0o077 != 0 {
+        if !metadata.is_dir()
+            || metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.permissions().mode() & 0o077 != 0
+        {
             return Err(failure(
-                "native stateDirectory must be a private directory (0700), not a symlink",
+                "native stateDirectory must be an owned private directory (0700), not a symlink",
             ));
         }
         let lock = OpenOptions::new()
@@ -347,35 +444,43 @@ impl NativeProcess {
         record.write_all(uid.as_bytes()).map_err(io)?;
         record.sync_all().map_err(io)?;
         File::open(root).and_then(|f| f.sync_all()).map_err(io)?;
+        let launch_id = uuid::Uuid::new_v4();
         let result = Command::new(&profile.executable)
             .args(&profile.args)
             .current_dir(&profile.working_directory)
             .env_clear()
             .envs(&profile.env)
+            .env("VELOS_INSTANCE_ID", launch_id.to_string())
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .process_group(0)
             .spawn();
-        let child = match result {
+        let mut child = match result {
             Ok(child) => child,
             Err(error) => {
                 std::fs::remove_file(&marker).map_err(io)?;
                 return Err(io(error));
             }
         };
+        let stdout_pipe = child.stdout.take();
+        let stderr_pipe = child.stderr.take();
         let mut owned = OwnedProcess {
-            child,
+            pid: child.id(),
+            child: Some(child),
+            launch_id,
+            cleanup_error: None,
+            cleanup_done: false,
             profile: profile_name.into(),
             marker,
             exit: None,
             drains: vec![],
         };
-        if let Some(pipe) = owned.child.stdout.take() {
-            owned.drains.push(drain(pipe, stdout));
+        if let Some(pipe) = stdout_pipe {
+            owned.drains.push(drain(pipe, stdout)?);
         }
-        if let Some(pipe) = owned.child.stderr.take() {
-            owned.drains.push(drain(pipe, stderr));
+        if let Some(pipe) = stderr_pipe {
+            owned.drains.push(drain(pipe, stderr)?);
         }
         Ok(owned)
     }
@@ -397,15 +502,18 @@ impl ContainerRuntime for NativeProcess {
                 "native argv and environment must come from the local profile",
             ));
         }
+        if !valid_name(&spec.uid) || !self.config.profiles.contains_key(profile) {
+            return Err(failure("invalid native uid or unprovisioned profile"));
+        }
         let mut instances = self.instances.lock().await;
         if let Some(existing) = instances.get(&spec.uid) {
             if existing.profile != *profile {
                 return Err(failure("cannot change an existing workload's profile"));
             }
-            return Ok(InstanceId(format!("native-{}", spec.uid)));
+            return Ok(existing.instance_id(&spec.uid));
         }
         for process in instances.values_mut() {
-            process.observe()?;
+            process.observe().await?;
             if process.profile == *profile && process.exit.is_none() {
                 return Err(failure("native profile already has a live instance"));
             }
@@ -429,8 +537,10 @@ impl ContainerRuntime for NativeProcess {
             None => 0,
         };
         attempts.insert(profile.clone(), (now, count));
-        instances.insert(spec.uid.clone(), self.launch(&spec.uid, profile)?);
-        Ok(InstanceId(format!("native-{}", spec.uid)))
+        let process = self.launch(&spec.uid, profile)?;
+        let id = process.instance_id(&spec.uid);
+        instances.insert(spec.uid.clone(), process);
+        Ok(id)
     }
 
     async fn stop(&self, uid: &str) -> Result<(), RuntimeError> {
@@ -438,7 +548,7 @@ impl ContainerRuntime for NativeProcess {
         let Some(process) = instances.get_mut(uid) else {
             return Ok(());
         };
-        if matches!(process.observe()?, InstanceState::Exited { .. }) {
+        if matches!(process.observe().await?, InstanceState::Exited { .. }) {
             return Ok(());
         }
         process.signal(libc::SIGTERM)?;
@@ -463,7 +573,7 @@ impl ContainerRuntime for NativeProcess {
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        process.observe()?;
+        process.observe().await?;
         Ok(())
     }
 
@@ -472,17 +582,20 @@ impl ContainerRuntime for NativeProcess {
         let process = instances
             .get_mut(uid)
             .ok_or_else(|| failure("no such native instance"))?;
-        if matches!(process.observe()?, InstanceState::Exited { .. }) {
+        if matches!(process.observe().await?, InstanceState::Exited { .. }) {
             let profile = process.profile.clone();
             for other in instances.values_mut() {
-                other.observe()?;
+                other.observe().await?;
                 if other.profile == profile && other.exit.is_none() {
                     return Err(failure("native profile already has a live instance"));
                 }
             }
             instances.insert(uid.into(), self.launch(uid, &profile)?);
         }
-        Ok(InstanceId(format!("native-{uid}")))
+        instances
+            .get(uid)
+            .map(|p| p.instance_id(uid))
+            .ok_or_else(|| failure("native instance missing after start"))
     }
 
     async fn remove(&self, uid: &str) -> Result<(), RuntimeError> {
@@ -493,19 +606,17 @@ impl ContainerRuntime for NativeProcess {
 
     async fn list(&self) -> Result<Vec<Instance>, RuntimeError> {
         let mut instances = self.instances.lock().await;
-        instances
-            .iter_mut()
-            .map(|(uid, process)| {
-                Ok(Instance {
-                    uid: uid.clone(),
-                    id: InstanceId(format!("native-{uid}")),
-                    state: process.observe()?,
-                    // Shared host networking is not a private container address. Never
-                    // route Services to an arbitrary loopback listener based on liveness.
-                    ip: None,
-                })
-            })
-            .collect()
+        let mut observed = Vec::with_capacity(instances.len());
+        for (uid, process) in instances.iter_mut() {
+            observed.push(Instance {
+                uid: uid.clone(),
+                id: process.instance_id(uid),
+                state: process.observe().await?,
+                // Shared host networking is never a container routing address.
+                ip: None,
+            });
+        }
+        Ok(observed)
     }
 
     async fn health(&self) -> Result<Vec<WorkloadHealth>, RuntimeError> {
@@ -513,13 +624,13 @@ impl ContainerRuntime for NativeProcess {
             let mut instances = self.instances.lock().await;
             let mut snapshots = vec![];
             for (uid, process) in instances.iter_mut() {
-                let running = matches!(process.observe()?, InstanceState::Running);
+                let running = matches!(process.observe().await?, InstanceState::Running);
                 let probe = self
                     .config
                     .profiles
                     .get(&process.profile)
                     .and_then(|p| p.readiness.clone());
-                snapshots.push((uid.clone(), process.child.id(), running, probe));
+                snapshots.push((uid.clone(), process.pid, process.launch_id, running, probe));
             }
             snapshots
         };
@@ -530,8 +641,8 @@ impl ContainerRuntime for NativeProcess {
             .build()
             .map_err(|e| failure(e.to_string()))?;
         let mut health = vec![];
-        for (uid, pid, running, probe) in snapshots {
-            let ready = match (running, probe) {
+        for (uid, pid, launch_id, running, probe) in snapshots {
+            let mut ready = match (running, probe) {
                 (false, _) => Some(false),
                 (true, None) => None,
                 (true, Some(probe)) => {
@@ -556,6 +667,8 @@ impl ContainerRuntime for NativeProcess {
                         Some(
                             value.get("pid").and_then(serde_json::Value::as_u64)
                                 == Some(pid.into())
+                                && value.get("instance").and_then(serde_json::Value::as_str)
+                                    .and_then(|value| uuid::Uuid::parse_str(value).ok()) == Some(launch_id)
                                 && value.get("ready").and_then(serde_json::Value::as_bool)
                                     == Some(true),
                         )
@@ -564,6 +677,19 @@ impl ContainerRuntime for NativeProcess {
                     Some(result.unwrap_or(false))
                 }
             };
+            // A stop/restart may have completed while the HTTP request was
+            // in flight. PID alone can be reused; compare the launch generation
+            // and freshly observed liveness before publishing readiness.
+            let mut instances = self.instances.lock().await;
+            let current = match instances.get_mut(&uid) {
+                Some(process) if process.launch_id == launch_id => {
+                    matches!(process.observe().await?, InstanceState::Running)
+                }
+                Some(_) | None => false,
+            };
+            if !current {
+                ready = Some(false);
+            }
             health.push(WorkloadHealth { uid, ready });
         }
         Ok(health)
@@ -571,13 +697,45 @@ impl ContainerRuntime for NativeProcess {
 
     async fn shutdown(&self) -> Result<(), RuntimeError> {
         let uids: Vec<_> = self.instances.lock().await.keys().cloned().collect();
+        let mut first_error = None;
         for uid in uids {
-            self.stop(&uid).await?;
+            if let Err(error) = self.stop(&uid).await {
+                tracing::error!(%uid, %error, "native shutdown cleanup failed");
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
         }
-        Ok(())
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 
     async fn version(&self) -> Result<String, RuntimeError> {
         Ok("native-process/1".into())
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn failed_log_writes_still_drain_the_pipe_to_eof() {
+        let (reader, mut writer) = std::os::unix::net::UnixStream::pair().unwrap();
+        // Read-only sink makes every nonempty write fail without filling disk.
+        let sink = File::open("/dev/null").unwrap();
+        let logging = drain(reader, sink).unwrap();
+        let producer = tokio::task::spawn_blocking(move || {
+            writer.write_all(&vec![b'x'; 2 * 1024 * 1024]).unwrap();
+        });
+        tokio::time::timeout(Duration::from_secs(3), async {
+            producer.await.unwrap();
+            logging.await.unwrap();
+        })
+        .await
+        .unwrap();
     }
 }

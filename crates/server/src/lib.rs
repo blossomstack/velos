@@ -186,15 +186,22 @@ fn validate_workload(kind: &str, doc: &Value) -> Result<(), ApiError> {
             "native workloads require explicit spec.nodeName for provisioned local profiles".into(),
         ));
     }
-    for field in ["image", "command", "env"] {
-        if doc.get("spec").and_then(|s| s.get(field)).is_some_and(|v| {
-            !v.is_null() && v != "" && v != &serde_json::json!([]) && v != &serde_json::json!({})
-        }) {
+    for (field, empty) in [
+        ("image", serde_json::json!("")),
+        ("command", serde_json::json!([])),
+        ("env", serde_json::json!({})),
+    ] {
+        if doc
+            .get("spec")
+            .and_then(|s| s.get(field))
+            .is_some_and(|v| !v.is_null() && v != &empty)
+        {
             return Err(ApiError::BadRequest(format!(
                 "native workload cannot set spec.{field}; use its local profile"
             )));
         }
     }
+
     Ok(())
 }
 
@@ -1503,6 +1510,19 @@ mod tests {
         assert!(
             validate_workload("Container", &serde_json::json!({"spec":{"image":"alpine"}})).is_ok()
         );
+    }
+
+    #[test]
+    fn native_admission_rejects_wrong_typed_empty_overrides() {
+        for (field, value) in [
+            ("image", serde_json::json!([])),
+            ("command", serde_json::json!({})),
+            ("env", serde_json::json!("")),
+        ] {
+            let mut doc = serde_json::json!({"spec":{"nodeName":"mini2","workload":{"type":"NativeProcess","object":{"profile":"model"}}}});
+            doc["spec"][field] = value;
+            assert!(validate_workload("Container", &doc).is_err());
+        }
     }
 
     #[test]

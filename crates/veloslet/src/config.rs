@@ -312,10 +312,21 @@ impl Edits {
 /// build graph turned on serde_json's `preserve_order`, which would make this
 /// output silently reorder itself on an unrelated dependency change.
 pub fn redacted_json(cfg: &WorkerConfig) -> Result<String> {
-    let masked = WorkerConfig {
+    let mut masked = WorkerConfig {
         credential: cfg.credential.as_ref().map(|_| REDACTED.to_string()),
         ..cfg.clone()
     };
+    match &mut masked.runtime {
+        velos_runtime::dispatch::RuntimeConfig::AppleContainer => {}
+        velos_runtime::dispatch::RuntimeConfig::NativeProcess(config)
+        | velos_runtime::dispatch::RuntimeConfig::Mixed(config) => {
+            for profile in config.profiles.values_mut() {
+                for value in profile.env.values_mut() {
+                    *value = REDACTED.to_string();
+                }
+            }
+        }
+    }
     serde_json::to_string_pretty(&masked).context("rendering worker config")
 }
 
