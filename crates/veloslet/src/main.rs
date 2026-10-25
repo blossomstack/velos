@@ -15,12 +15,10 @@
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command as Process;
-use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
-use velos_runtime::{AppleContainer, ContainerRuntime};
 use veloslet::config::{self, Edits, Field};
 use veloslet::daemon::{self, BUNDLE_EXECUTABLE, BUNDLE_ID, Bearer, WorkerConfig};
 use veloslet::host::{detect_address, detect_host, detect_system_info, validate_capacity};
@@ -191,7 +189,7 @@ async fn setup(args: SetupArgs) -> Result<()> {
     let host = detect_host()?;
     validate_capacity(cfg.cpu, cfg.memory, host)?;
 
-    let runtime = AppleContainer::new();
+    let runtime = cfg.runtime.build()?;
     // Before reading the version, not after: a Mac that has just rebooted has
     // the CLI on PATH and its services down, and registering is the moment this
     // worker advertises what it can do.
@@ -307,7 +305,7 @@ async fn run(path: PathBuf) -> Result<()> {
     // is minted, so an unjoined config stops here with a message that says so.
     let bearer = cfg.bearer()?;
 
-    let runtime = AppleContainer::new();
+    let runtime = cfg.runtime.build()?;
     // Before reading the version, not after: a Mac that has just rebooted has
     // the CLI on PATH and its services down, and registering is the moment this
     // worker advertises what it can do.
@@ -337,17 +335,23 @@ async fn run(path: PathBuf) -> Result<()> {
     }
     tracing::info!("registered worker {} with its credential", cfg.node);
 
-    let runtime: Arc<dyn ContainerRuntime> = Arc::new(runtime);
     tracing::info!("veloslet {} reconciling against {}", cfg.node, cfg.server);
-    run_loop(
-        client,
-        runtime,
-        cfg.node,
-        Duration::from_secs(cfg.reconcile_secs),
-        Duration::from_secs(cfg.heartbeat_secs),
-        cfg.lease_secs,
-    )
-    .await;
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    tokio::select! {
+        _ = run_loop(
+            client,
+            std::sync::Arc::clone(&runtime),
+            cfg.node,
+            Duration::from_secs(cfg.reconcile_secs),
+            Duration::from_secs(cfg.heartbeat_secs),
+            cfg.lease_secs,
+        ) => {},
+        _ = tokio::signal::ctrl_c() => {},
+        _ = terminate.recv() => {},
+    }
+    // Container instances retain their existing independent lifecycle. Native
+    // children are owned by this worker; stop those before dropping the runtime.
+    runtime.shutdown().await?;
     Ok(())
 }
 

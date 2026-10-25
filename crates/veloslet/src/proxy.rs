@@ -23,6 +23,7 @@
 //! no replica refuses the connection and drops out of rotation on its own.
 
 use std::collections::HashMap;
+use std::net::Ipv4Addr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -122,22 +123,37 @@ pub fn plan_bindings(services: &[ServiceView], locals: &[LocalContainer]) -> Vec
 // Actuation
 // ---------------------------------------------------------------------------
 
-/// A live listener plus the handle used to keep its backend list current.
-struct Listener {
+/// Owner and destinations change together for new connections. Existing
+/// streams keep the snapshot selected when they were accepted.
+#[derive(Clone)]
+struct Routes {
     service: String,
-    backends: watch::Sender<Vec<String>>,
+    backends: Vec<String>,
+}
+
+/// A live listener plus its atomically replaceable route snapshot.
+struct Listener {
+    routes: watch::Sender<Routes>,
     /// `None` only while [`Listener::stop`] is taking the handle to await it.
     task: Option<JoinHandle<()>>,
 }
 
 impl Listener {
+    fn new(socket: TcpListener, service: String, backends: Vec<String>, port: u16) -> Self {
+        tracing::info!(node_port = port, %service, backends = backends.len(), "serving service proxy");
+        let (tx, rx) = watch::channel(Routes { service, backends });
+        Self {
+            routes: tx,
+            task: Some(tokio::spawn(serve(socket, rx, port))),
+        }
+    }
+
     /// Stop serving and wait until the socket is actually released.
     ///
     /// The await is load-bearing. `abort` only *requests* cancellation: the
     /// accept loop owns the socket, so the port stays bound until the task is
-    /// polled and dropped. Rebinding it in the same pass — which is exactly what
-    /// happens when a node port is reassigned to another Service — would
-    /// otherwise fail with "address already in use" and leave the port dark.
+    /// polled and dropped. Awaiting it makes removal observable to a later
+    /// bind. Owner changes keep the socket and atomically replace its routes.
     async fn stop(mut self) {
         if let Some(task) = self.task.take() {
             task.abort();
@@ -156,12 +172,27 @@ impl Drop for Listener {
 }
 
 /// The set of node-port listeners this worker is running.
-#[derive(Default)]
 pub struct NodeProxy {
+    bind_ip: Ipv4Addr,
     listeners: Mutex<HashMap<u16, Listener>>,
 }
 
+impl Default for NodeProxy {
+    fn default() -> Self {
+        Self::with_bind_ip(Ipv4Addr::UNSPECIFIED)
+    }
+}
+
 impl NodeProxy {
+    /// Restrict listeners to an interface, e.g. loopback for isolated tests.
+    /// The default constructor preserves existing all-interface NodePorts.
+    pub fn with_bind_ip(bind_ip: Ipv4Addr) -> Self {
+        Self {
+            bind_ip,
+            listeners: Mutex::new(HashMap::new()),
+        }
+    }
+
     pub fn new() -> Self {
         Self::default()
     }
@@ -186,16 +217,12 @@ impl NodeProxy {
         let mut listeners = self.listeners.lock().await;
         let stale: Vec<u16> = listeners
             .iter()
-            .filter(|(port, live)| {
-                !desired
-                    .iter()
-                    .any(|b| b.node_port == **port && b.service == live.service)
-            })
+            .filter(|(port, _)| !desired.iter().any(|b| b.node_port == **port))
             .map(|(port, _)| *port)
             .collect();
         for port in stale {
             if let Some(live) = listeners.remove(&port) {
-                tracing::info!(node_port = port, service = %live.service, "stopping service proxy");
+                tracing::info!(node_port = port, service = %live.routes.borrow().service, "stopping service proxy");
                 live.stop().await;
             }
         }
@@ -203,30 +230,25 @@ impl NodeProxy {
         for binding in desired {
             match listeners.get(&binding.node_port) {
                 Some(live) => {
-                    // `send` unconditionally: the receiver reads the value at
-                    // accept time rather than waiting on a change, so a repeated
-                    // value is harmless and a skipped one would be a stale route.
-                    let _ = live.backends.send(binding.backends);
+                    // Reassign ownership and destinations without releasing the
+                    // socket. Close/rebind has a race with other binders (and
+                    // forked children temporarily holding the inherited fd).
+                    // Established streams already hold their own snapshot.
+                    live.routes.send_replace(Routes {
+                        service: binding.service,
+                        backends: binding.backends,
+                    });
                 }
-                None => match TcpListener::bind(("0.0.0.0", binding.node_port)).await {
+                None => match TcpListener::bind((self.bind_ip, binding.node_port)).await {
                     Ok(socket) => {
-                        let (tx, rx) = watch::channel(binding.backends.clone());
-                        let service = binding.service.clone();
-                        let port = binding.node_port;
-                        tracing::info!(
-                            node_port = port,
-                            service = %service,
-                            backends = binding.backends.len(),
-                            "serving service proxy"
-                        );
-                        let task = tokio::spawn(serve(socket, rx, service.clone(), port));
                         listeners.insert(
-                            port,
-                            Listener {
-                                service,
-                                backends: tx,
-                                task: Some(task),
-                            },
+                            binding.node_port,
+                            Listener::new(
+                                socket,
+                                binding.service,
+                                binding.backends,
+                                binding.node_port,
+                            ),
                         );
                     }
                     Err(e) => tracing::warn!(
@@ -242,12 +264,7 @@ impl NodeProxy {
 
 /// Accept loop for one node port. Each connection is handed to the next backend
 /// in round-robin order and proxied bidirectionally until either side closes.
-async fn serve(
-    socket: TcpListener,
-    backends: watch::Receiver<Vec<String>>,
-    service: String,
-    node_port: u16,
-) {
+async fn serve(socket: TcpListener, routes: watch::Receiver<Routes>, node_port: u16) {
     let next = Arc::new(AtomicUsize::new(0));
     loop {
         let (mut client, peer) = match socket.accept().await {
@@ -255,20 +272,21 @@ async fn serve(
             Err(e) => {
                 // A failing accept can fail immediately and forever (fd
                 // exhaustion), so back off rather than spin a core.
-                tracing::warn!(node_port, service = %service, "accept failed: {e}");
+                tracing::warn!(node_port, service = %routes.borrow().service, "accept failed: {e}");
                 tokio::time::sleep(Duration::from_millis(100)).await;
                 continue;
             }
         };
         // Read the routes at accept time, so a reschedule takes effect on the
         // next connection without disturbing the ones already open.
-        let live = backends.borrow().clone();
-        if live.is_empty() {
+        let live = routes.borrow().clone();
+        let service = live.service;
+        if live.backends.is_empty() {
             tracing::debug!(node_port, service = %service, "no backend for {peer}");
             continue;
         }
-        let target = live[next.fetch_add(1, Ordering::Relaxed) % live.len()].clone();
-        let service = service.clone();
+        let target =
+            live.backends[next.fetch_add(1, Ordering::Relaxed) % live.backends.len()].clone();
         tokio::spawn(async move {
             match TcpStream::connect(&target).await {
                 Ok(mut upstream) => {
@@ -389,32 +407,91 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sync_binds_stops_and_rebuilds_on_reassignment() {
-        let proxy = NodeProxy::new();
-        proxy
-            .sync(vec![ProxyBinding {
-                node_port: 31111,
-                service: "web".to_string(),
-                backends: vec!["127.0.0.1:9".to_string()],
-            }])
-            .await;
-        assert_eq!(proxy.bound_ports().await, vec![31111]);
+    async fn sync_reassigns_routes_without_rebinding() {
+        let (proxy, port) = listening_proxy("web", vec!["127.0.0.1:9".into()]).await;
+        assert_eq!(proxy.bound_ports().await, vec![port]);
 
-        // Same port, different owner → the old listener must go, or the new
-        // Service silently inherits the previous one's routes.
+        let original_task = proxy.listeners.lock().await[&port]
+            .task
+            .as_ref()
+            .unwrap()
+            .id();
+        // Same port, different owner: atomically replace routes, keeping the
+        // bound socket so no close/rebind window can make the port disappear.
         proxy
             .sync(vec![ProxyBinding {
-                node_port: 31111,
+                node_port: port,
                 service: "api".to_string(),
                 backends: vec!["127.0.0.1:9".to_string()],
             }])
             .await;
         let held = proxy.listeners.lock().await;
-        assert_eq!(held.get(&31111).map(|l| l.service.as_str()), Some("api"));
+        assert_eq!(held[&port].routes.borrow().service, "api");
+        assert_eq!(held[&port].task.as_ref().unwrap().id(), original_task);
         drop(held);
 
         proxy.sync(Vec::new()).await;
         assert!(proxy.bound_ports().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn reassignment_switches_new_connections_and_preserves_existing_streams() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        async fn backend(byte: u8) -> (String, JoinHandle<()>) {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap().to_string();
+            let task = tokio::spawn(async move {
+                while let Ok((mut stream, _)) = listener.accept().await {
+                    tokio::spawn(async move {
+                        let mut input = [0];
+                        while stream.read_exact(&mut input).await.is_ok() {
+                            if stream.write_all(&[byte]).await.is_err() {
+                                break;
+                            }
+                        }
+                    });
+                }
+            });
+            (address, task)
+        }
+        async fn exchange(stream: &mut TcpStream) -> u8 {
+            tokio::time::timeout(Duration::from_secs(2), async {
+                stream.write_all(&[0]).await.unwrap();
+                stream.read_u8().await.unwrap()
+            })
+            .await
+            .unwrap()
+        }
+        let (first, first_task) = backend(1).await;
+        let (second, second_task) = backend(2).await;
+        let (proxy, port) = listening_proxy("first", vec![first.clone()]).await;
+        let mut established = TcpStream::connect((Ipv4Addr::LOCALHOST, port))
+            .await
+            .unwrap();
+        assert_eq!(exchange(&mut established).await, 1);
+        for step in 0..50 {
+            let (owner, target, expected) = if step % 2 == 0 {
+                ("second", &second, 2)
+            } else {
+                ("first", &first, 1)
+            };
+            proxy
+                .sync(vec![ProxyBinding {
+                    node_port: port,
+                    service: owner.into(),
+                    backends: vec![target.clone()],
+                }])
+                .await;
+            let mut new_connection = TcpStream::connect((Ipv4Addr::LOCALHOST, port))
+                .await
+                .unwrap();
+            assert_eq!(exchange(&mut new_connection).await, expected);
+            assert_eq!(exchange(&mut established).await, 1);
+        }
+        drop(established);
+        proxy.sync(vec![]).await;
+        first_task.abort();
+        second_task.abort();
     }
 
     #[tokio::test]
@@ -429,15 +506,7 @@ mod tests {
             let _ = tokio::io::copy(&mut r, &mut w).await;
         });
 
-        let node_port = free_port().await;
-        let proxy = NodeProxy::new();
-        proxy
-            .sync(vec![ProxyBinding {
-                node_port,
-                service: "echo".to_string(),
-                backends: vec![backend_addr.to_string()],
-            }])
-            .await;
+        let (proxy, node_port) = listening_proxy("echo", vec![backend_addr.to_string()]).await;
 
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let mut client = TcpStream::connect(("127.0.0.1", node_port)).await.unwrap();
@@ -446,13 +515,19 @@ mod tests {
         let mut got = Vec::new();
         client.read_to_end(&mut got).await.unwrap();
         assert_eq!(&got, b"ping");
+        proxy.sync(vec![]).await;
     }
 
-    /// A port nothing is listening on, obtained by binding and releasing.
-    async fn free_port() -> u16 {
-        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = l.local_addr().unwrap().port();
-        drop(l);
-        port
+    /// Hold the OS-assigned socket continuously. Binding and releasing a
+    /// "free port" permits parallel tests to claim the same address.
+    async fn listening_proxy(service: &str, backends: Vec<String>) -> (NodeProxy, u16) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let proxy = NodeProxy::with_bind_ip(Ipv4Addr::LOCALHOST);
+        proxy.listeners.lock().await.insert(
+            port,
+            Listener::new(listener, service.into(), backends, port),
+        );
+        (proxy, port)
     }
 }

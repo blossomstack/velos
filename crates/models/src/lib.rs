@@ -3,8 +3,9 @@
 // fluorite emits `derive_new::new` constructors that take one argument per
 // field; for wide envelope structs (e.g. ObjectMeta) this trips
 // `clippy::too_many_arguments`. The generated constructors are intentional, so
-// the lint is allowed for the generated module only.
-#[allow(clippy::too_many_arguments)]
+// these lints are allowed for the generated module only. Clippy 1.99 also
+// checks redundant field names emitted by derive_new in those constructors.
+#[allow(clippy::too_many_arguments, clippy::redundant_field_names)]
 pub mod velos {
     include!(concat!(env!("OUT_DIR"), "/velos/mod.rs"));
 }
@@ -41,7 +42,8 @@ impl Container {
         Container::new(
             ObjectMeta::new_named(name),
             ContainerSpec::new(
-                image.into(),
+                None, // workload: legacy container
+                Some(image.into()),
                 Vec::new(),
                 HashMap::new(),
                 ResourceReqs::new(1, 512 * 1024 * 1024),
@@ -53,6 +55,7 @@ impl Container {
                 Vec::new(),     // tolerations
             ),
             ContainerStatus::new(
+                None, // application readiness unknown
                 ContainerPhase::Pending,
                 None, // worker_name
                 None, // container_id
@@ -99,6 +102,19 @@ mod tests {
         // round-trip below proves the field exists and deserializes.
         let back: Container = serde_json::from_str(&json).unwrap();
         assert_eq!(c, back);
+    }
+
+    #[test]
+    fn native_wire_spec_omits_container_image() {
+        let mut c = Container::pending("model", "unused");
+        c.spec.image = None;
+        c.spec.workload = Some(NativeWorkload::NativeProcess(NativeProcessRef::new(
+            "model".into(),
+        )));
+        let json = serde_json::to_value(&c).unwrap();
+        assert!(json["spec"].get("image").is_none());
+        assert_eq!(json["spec"]["workload"]["object"]["profile"], "model");
+        assert_eq!(serde_json::from_value::<Container>(json).unwrap(), c);
     }
 
     #[test]

@@ -105,6 +105,10 @@ pub fn resolve_setup(fields: Edits, existing: Option<WorkerConfig>) -> Result<Wo
     // ever drifted apart.
     let required = |name: &str| anyhow::anyhow!("{name} is required");
     Ok(WorkerConfig {
+        runtime: existing
+            .as_ref()
+            .map(|c| c.runtime.clone())
+            .unwrap_or_default(),
         server: fields
             .server
             .or_else(|| existing.as_ref().map(|b| b.server.clone()))
@@ -308,10 +312,21 @@ impl Edits {
 /// build graph turned on serde_json's `preserve_order`, which would make this
 /// output silently reorder itself on an unrelated dependency change.
 pub fn redacted_json(cfg: &WorkerConfig) -> Result<String> {
-    let masked = WorkerConfig {
+    let mut masked = WorkerConfig {
         credential: cfg.credential.as_ref().map(|_| REDACTED.to_string()),
         ..cfg.clone()
     };
+    match &mut masked.runtime {
+        velos_runtime::dispatch::RuntimeConfig::AppleContainer => {}
+        velos_runtime::dispatch::RuntimeConfig::NativeProcess(config)
+        | velos_runtime::dispatch::RuntimeConfig::Mixed(config) => {
+            for profile in config.profiles.values_mut() {
+                for value in profile.env.values_mut() {
+                    *value = REDACTED.to_string();
+                }
+            }
+        }
+    }
     serde_json::to_string_pretty(&masked).context("rendering worker config")
 }
 
@@ -322,6 +337,7 @@ mod tests {
 
     fn base() -> WorkerConfig {
         WorkerConfig {
+            runtime: Default::default(),
             server: "http://h:8088".to_string(),
             node: "node-a".to_string(),
             credential: None,

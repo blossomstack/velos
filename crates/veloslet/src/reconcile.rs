@@ -5,7 +5,7 @@
 //! actually reports, and returns the actions that converge the two. All matching
 //! is keyed by container **uid**, which makes the result idempotent across crashes.
 
-use velos_runtime::{InstanceState, RunSpec};
+use velos_runtime::{InstanceState, RunSpec, Workload};
 
 /// Restart behavior for a container (mirrors `velos::RestartPolicy`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,7 +58,7 @@ impl DesiredState {
 pub struct DesiredContainer {
     pub name: String,
     pub uid: String,
-    pub image: String,
+    pub workload: Workload,
     pub command: Vec<String>,
     pub env: Vec<(String, String)>,
     pub restart_policy: RestartPolicy,
@@ -72,7 +72,7 @@ impl DesiredContainer {
     fn run_spec(&self) -> RunSpec {
         RunSpec {
             uid: self.uid.clone(),
-            image: self.image.clone(),
+            workload: self.workload.clone(),
             command: self.command.clone(),
             env: self.env.clone(),
         }
@@ -300,7 +300,9 @@ mod tests {
         DesiredContainer {
             name: name.to_string(),
             uid: format!("uid-{name}"),
-            image: "img".to_string(),
+            workload: Workload::Container {
+                image: "img".to_string(),
+            },
             command: vec![],
             env: vec![],
             restart_policy: policy,

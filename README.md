@@ -225,3 +225,10 @@ Engineering conventions and the design philosophy live in [`CLAUDE.md`](CLAUDE.m
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+### Native macOS / MLX workloads
+
+Opt-in native process profiles can run pinned, externally provisioned Python model
+servers alongside container workloads. See [native workload configuration, ownership,
+readiness and validation limits](docs/native-workloads.md). This local implementation
+preview is not yet cleared for deployment.

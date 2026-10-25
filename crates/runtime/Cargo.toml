@@ -10,8 +10,13 @@ description = "The Velos container-runtime seam and its backends."
 workspace = true
 
 [dependencies]
+velos-models = { workspace = true }
 async-trait = "0.1"
 thiserror = "2.0"
-tokio = { version = "1", features = ["process", "rt", "macros"] }
+tokio = { version = "1", features = ["process", "rt", "macros", "sync", "time", "io-util", "net", "fs"] }
 serde_json = "1.0"
 tracing = "0.1"
+serde = { version = "1", features = ["derive"] }
+libc = "0.2"
+reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
+uuid = { version = "1", features = ["v4"] }

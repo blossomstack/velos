@@ -92,9 +92,25 @@ fn desired_from_doc(doc: &Value) -> Option<DesiredContainer> {
         .unwrap_or(false);
 
     Some(DesiredContainer {
-        name,
+        name: name.clone(),
         uid,
-        image,
+        workload: match doc.pointer("/spec/workload") {
+            None | Some(Value::Null) => velos_runtime::Workload::Container { image },
+            Some(value) => {
+                match serde_json::from_value::<velos_runtime::native::NativeWorkload>(value.clone())
+                {
+                    Ok(velos_runtime::native::NativeWorkload::NativeProcess(reference)) => {
+                        velos_runtime::Workload::NativeProcess {
+                            profile: reference.profile,
+                        }
+                    }
+                    Err(error) => {
+                        tracing::error!(%name, %error, "invalid workload assignment");
+                        return None;
+                    }
+                }
+            }
+        },
         command,
         env,
         restart_policy,
@@ -292,6 +308,26 @@ pub async fn run_once(
             // Isolated on purpose: one container that cannot start must not cost
             // every other container on this worker its reconcile pass.
             Err(e) => report_failure(client, &assigned, node, target.as_deref(), reason, &e).await,
+        }
+    }
+    for health in runtime.health().await? {
+        let Some(name) = desired
+            .iter()
+            .find(|d| d.uid == health.uid)
+            .map(|d| &d.name)
+        else {
+            continue;
+        };
+        if let Some(doc) = client.get_container(name).await? {
+            let mut status = doc
+                .get("status")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({}));
+            let ready = serde_json::json!(health.ready);
+            if status.get("ready") != Some(&ready) {
+                status["ready"] = ready;
+                client.put_status(name, status).await?;
+            }
         }
     }
     Ok(applied)

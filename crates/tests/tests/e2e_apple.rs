@@ -14,6 +14,8 @@
 //! This test is always enabled (no `#[ignore]`): on a host with a working Apple
 //! `container` CLI it runs for real end to end; everywhere else it **self-skips**
 //! (the `container` binary isn't callable), so `cargo test` and CI stay green.
+//! Isolated local validation can set `VELOS_TEST_SKIP_APPLE=1` to avoid touching
+//! an installed runtime. The default behavior remains unchanged.
 //! Run it explicitly with output via:
 //!
 //!     cargo test -p velos-tests --test e2e_apple -- --nocapture
@@ -112,6 +114,12 @@ async fn await_phase(
 
 #[tokio::test]
 async fn real_container_lifecycle_with_apple_containerization() {
+    if std::env::var("VELOS_TEST_SKIP_APPLE").as_deref() == Ok("1") {
+        eprintln!(
+            "SKIP: real Apple Containerization explicitly disabled for isolated local validation"
+        );
+        return;
+    }
     if !AppleContainer::new().available().await {
         eprintln!("SKIP: Apple `container` CLI not available on this host");
         return;
@@ -124,7 +132,9 @@ async fn real_container_lifecycle_with_apple_containerization() {
         let probe = AppleContainer::new();
         let spec = RunSpec {
             uid: "preflight".to_string(),
-            image: IMAGE.to_string(),
+            workload: velos_runtime::Workload::Container {
+                image: IMAGE.to_string(),
+            },
             command: vec!["true".to_string()],
             env: vec![],
         };
