@@ -2,9 +2,10 @@
 
 // fluorite emits `derive_new::new` constructors that take one argument per
 // field; for wide envelope structs (e.g. ObjectMeta) this trips
-// `clippy::too_many_arguments`. The generated constructors are intentional, so
-// the lint is allowed for the generated module only.
-#[allow(clippy::too_many_arguments)]
+// `clippy::too_many_arguments`, and since Rust 1.100 their `field: field`
+// bodies trip `clippy::redundant_field_names`. The generated constructors are
+// intentional, so both lints are allowed for the generated module only.
+#[allow(clippy::too_many_arguments, clippy::redundant_field_names)]
 pub mod velos {
     include!(concat!(env!("OUT_DIR"), "/velos/mod.rs"));
 }
